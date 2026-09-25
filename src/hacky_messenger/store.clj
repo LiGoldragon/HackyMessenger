@@ -28,6 +28,11 @@
     #(call 'pod.huahaiy.datalevin/transact! %
            [(assoc route :hm/identity (str "route/" flow) :hm/kind :route :hm/flow flow)])))
 
+(defn remove-route! [root flow]
+  (with-connection root
+    #(call 'pod.huahaiy.datalevin/transact! %
+           [[:db/retractEntity [:hm/identity (str "route/" flow)]]])))
+
 (defn index-attempt! [root attempt]
   (with-connection root
     #(call 'pod.huahaiy.datalevin/transact! %

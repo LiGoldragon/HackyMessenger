@@ -24,7 +24,7 @@
 
 (defn fail [s] (throw (ex-info s {:hm/failure true})))
 (defn valid! [schema value label] (if (m/validate schema value) value (fail (str "Invalid " label ": " (pr-str (m/explain schema value))))))
-(declare atomic-edn! ->EdnLedger record-attempt! record-pending!)
+(declare atomic-edn! ->EdnLedger record-attempt! record-pending! route-records)
 (defn flow-id! [value]
   (when-not (and (string? value) (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" value))
     (fail "Flow ID must contain only letters, digits, underscores, or hyphens"))
@@ -247,7 +247,7 @@
     attempt))
 (defn reserve! [flow]
   (let [owner (flow-id! (or *flow-id* (System/getenv "FLOW_ID") flow))
-        reply (shell {:out :string :err :string :timeout 15000}
+        reply (shell {:out :string :err :string :continue true :timeout 15000}
                      "orchestrate"
                      (str "Lock.{ HackyMessengerDelivery " owner " [ " (quote-datom (root)) " ] «Register or submit through Herdr» }"))
         match (re-find #"Locked\.\{\s+(\d+)\b" (:out reply))]
@@ -255,7 +255,7 @@
       (fail (str "Reservation refused: " (str/trim (or (not-empty (:out reply)) (:err reply) "")))))
     (valid! Reservation {:id (parse-long (second match)) :flow flow :root (str (root))} "Reservation")))
 (defn release! [reservation]
-  (let [reply (shell {:out :string :err :string :timeout 15000} "orchestrate" (str "Release." (:id reservation)))]
+  (let [reply (shell {:out :string :err :string :continue true :timeout 15000} "orchestrate" (str "Release." (:id reservation)))]
     (when-not (and (zero? (:exit reply)) (str/starts-with? (:out reply) "Released."))
       (fail (str "Reservation release failed: " (str/trim (or (not-empty (:out reply)) (:err reply) "")))))))
 (defn with-reservation [flow f]
@@ -298,6 +298,46 @@
       (save-route! (->EdnRegistry (root)) flow route)
       (store/index-route! (root) flow route)
       (str "Registered " flow ": " name " (" session ")"))))
+(defn nonempty-strings! [label fields]
+  (when-not (every? #(and (string? %) (not (str/blank? %))) fields)
+    (fail label)))
+(defn deregister! [flow session pane-id terminal-id name]
+  (flow-id! flow)
+  (nonempty-strings! "Deregister requires every exact stale route identity field" [session pane-id terminal-id name])
+  (with-reservation flow
+    (fn []
+      (let [actual (read-route flow)]
+        (when-not (= {:session session :pane_id pane-id :terminal_id terminal-id :name name}
+                     (select-keys actual [:session :pane_id :terminal_id :name]))
+          (fail "Registration differs from the explicitly revalidated stale route"))
+        (fs/delete (path flow))
+        (store/remove-route! (root) flow)
+        (str "Deregistered stale " flow ": " name " (" session "/" pane-id "/" terminal-id ")")))))
+(defn rebind! [flow old-name new-name session pane-id terminal-id agent native-thread]
+  (flow-id! flow)
+  (nonempty-strings! "Rebind requires every exact old route identity field" [old-name session pane-id terminal-id agent])
+  (when (or (not (string? new-name)) (str/blank? new-name) (= old-name new-name))
+    (fail "Rebind requires a distinct nonempty new agent name"))
+  (native-thread! native-thread)
+  (with-reservation flow
+    (fn []
+      (assert-not-retired! flow)
+      (let [actual (read-route flow)
+            expected {:session session :name old-name :pane_id pane-id :terminal_id terminal-id :agent agent}]
+        (when-not (= expected (select-keys actual (keys expected)))
+          (fail "Registration differs from the explicitly revalidated old binding"))
+        (when-not (= native-thread (:native_thread actual))
+          (fail "Registration differs from the explicitly revalidated native thread"))
+        (when (some #(and (not= flow (key %)) (= session (get-in % [1 :session])) (= new-name (get-in % [1 :name])))
+                    (route-records))
+          (fail (str "New agent name " new-name " is already registered in " session)))
+        (let [replacement (route-binding! (assoc actual :name new-name))]
+          ;; `verify-target!` checks exact live identity, readiness, blocked
+          ;; state, and native process before the registry name is changed.
+          (verify-target! replacement)
+          (atomic-edn! (path flow) replacement)
+          (store/index-route! (root) flow replacement)
+          (str "Rebound " flow ": " old-name " -> " new-name " (" session "/" pane-id "/" terminal-id ")"))))))
 (defn send! [flow body wait-presented pane]
   (flow-id! flow) (valid! MessageBody body "MessageBody")
   (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))

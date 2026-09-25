@@ -218,3 +218,23 @@
         (is (= "Registered 00f95a: Mind Sol 00f95a (s)"
                (hm/register! "00f95a" (:name route) "s" (:native_thread route) marker transcript)))
         (is (= marker (get-in (hm/read-route "00f95a") [:readiness_proof :marker])))))))
+
+(deftest deregister-and-rebind-keep-an-exact-live-binding
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-lifecycle-"}))
+        process [{:argv ["codex" "--thread" (:native_thread route)]}]
+        rebound (assoc route :name "Mind Sol renamed" :interactive_ready true :agent_status "working")]
+    (binding [hm/*root* root-path hm/*with-reservation* pass-reservation]
+      (hm/atomic-edn! (hm/path "00f95a") route)
+      (store/index-route! root-path "00f95a" route)
+      (is (= "Deregistered stale 00f95a: Mind Sol 00f95a (s/p/t)"
+             (hm/deregister! "00f95a" "s" "p" "t" "Mind Sol 00f95a")))
+      (is (false? (fs/exists? (hm/path "00f95a"))))
+      (is (empty? (store/routes-for root-path)))
+      (hm/atomic-edn! (hm/path "00f95a") route)
+      (store/index-route! root-path "00f95a" route)
+      (binding [hm/*transport* (fake-transport rebound rebound process (atom 0))]
+        (is (= "Rebound 00f95a: Mind Sol 00f95a -> Mind Sol renamed (s/p/t)"
+               (hm/rebind! "00f95a" "Mind Sol 00f95a" "Mind Sol renamed" "s" "p" "t" "codex" (:native_thread route))))
+        (is (= "Mind Sol renamed" (:name (hm/read-route "00f95a"))))
+        (is (thrown? Exception
+                     (hm/rebind! "00f95a" "Mind Sol renamed" "again" "s" "p" "t" "codex" "different-native-thread")))))))
