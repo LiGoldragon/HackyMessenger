@@ -32,7 +32,9 @@
           []
           [(assoc route :pane_id pane)])))
     (target-agent* [_ route] {:agent route})
-    (process-info* [_ _] {:process_info {:foreground_processes [{:pid 123 :argv ["codex" "--thread" (:native_thread route)]}]}})
+    ;; Codex remote panes do not include the stored UUID in argv; PID plus the
+    ;; verified terminal and harness identity is Python's accepted evidence.
+    (process-info* [_ _] {:process_info {:foreground_processes [{:pid 123 :argv ["codex" "remote"]}]}})
     (pane* [_ requested] {:pane {:pane_id (:pane_id requested) :terminal_id (:terminal_id route) :agent (:agent route)
                                  :workspace_id (if (= "p" (:pane_id requested)) "w1" (if (= "m" (:pane_id requested)) "w2" "w1"))}})
     (move-pane* [_ requested workspace _]
