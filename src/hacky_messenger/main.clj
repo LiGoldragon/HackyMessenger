@@ -3,18 +3,43 @@
 (defn usage [] (str "Usage: hm-clj <send|send-abrupt|register|deregister|rebind|move|retire|import-retirement|list> ...\n" hm/skill-note))
 (defn arg [xs option] (second (drop-while #(not= option %) xs)))
 (defn parse-error [message] (throw (ex-info message {:hm/parse true})))
+(def value-options #{"--session" "--native-thread" "--readiness-probe" "--rollout" "--old-name" "--pane-id" "--terminal-id" "--name" "--agent" "--process-pid" "--evidence" "--evidence-sha256" "--hold-seconds" "--pane"})
+(defn expand-equals [xs]
+  (mapcat #(if-let [[_ option value] (re-matches #"(--[^=]+)=(.*)" %)] [option value] [%]) xs))
+(defn normalize-options [xs]
+  (let [xs (vec (expand-equals xs))]
+    (loop [remaining xs positional [] options []]
+      (if-let [value (first remaining)]
+        (cond
+          (= value "--wait-presented") (recur (next remaining) positional (conj options value))
+          (contains? value-options value) (if-let [argument (second remaining)]
+                                            (recur (nnext remaining) positional (into options [value argument]))
+                                            (parse-error (str "argument " value ": expected one argument")))
+          (.startsWith value "--") (recur (next remaining) positional (conj options value))
+          :else (recur (next remaining) (conj positional value) options))
+        (into positional options)))))
+(defn extra-values! [xs allowed]
+  (loop [remaining xs]
+    (when-let [value (first remaining)]
+      (cond
+        (= value "--wait-presented") (recur (next remaining))
+        (contains? value-options value) (recur (nnext remaining))
+        (contains? allowed value) (recur (next remaining))
+        :else (parse-error (str "unrecognized arguments: " value))))))
 (defn unknown-flags! [xs allowed]
   (doseq [value xs :when (and (.startsWith value "--") (not (contains? allowed value)))]
     (parse-error (str "unrecognized arguments: " value))))
 (defn -main [& argv]
   (try
-    (let [[op & xs] argv]
+    (let [[op & raw-xs] argv
+          xs (normalize-options raw-xs)]
       (if (or (= op "--help") (= op "-h") (some #{"--help" "-h"} xs))
         (println (usage))
         (case op
           "send" (let [[flow body & rest] xs]
                    (when-not (and flow body) (parse-error "the following arguments are required: flow, message"))
                    (unknown-flags! rest #{"--wait-presented" "--hold-seconds" "--pane"})
+                   (extra-values! rest #{"--wait-presented" "--hold-seconds" "--pane"})
                    (let [hold (or (arg rest "--hold-seconds") "10")]
                      (when-not (try (<= 0 (Double/parseDouble hold) 60) (catch Exception _ false))
                        (parse-error "argument --hold-seconds: invalid float value")))
@@ -22,6 +47,7 @@
           "send-abrupt" (let [[flow body & rest] xs]
                           (when-not (and flow body) (parse-error "the following arguments are required: flow, message"))
                           (unknown-flags! rest #{"--wait-presented" "--hold-seconds"})
+                          (extra-values! rest #{"--wait-presented" "--hold-seconds"})
                           (let [hold (or (arg rest "--hold-seconds") "10")]
                             (when-not (try (<= 0 (Double/parseDouble hold) 60) (catch Exception _ false))
                               (parse-error "argument --hold-seconds: invalid float value")))
