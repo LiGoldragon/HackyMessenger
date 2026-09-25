@@ -19,7 +19,7 @@ ledger. There is no Python runtime fallback.
 
 ## Message shape
 
-The recipient sees one line of tagged EDN:
+Machine prose is tagged EDN:
 
 ```clojure
 #msg ["FLOW_ID" "text"]
@@ -29,10 +29,22 @@ The vector contains the sender Flow ID and the message text. Time, recipient,
 harness kind, route identity, delivery attempts, pending messages, and
 retirements stay in the typed ledger.
 
-Pass only the body to `hm-send` or `messenger-clj send`. A body that parses as
-one complete `#msg` form is rejected. Ordinary prose may mention `#msg`.
-Messages longer than the one line pane limit are written under the sender's
-`flows/FLOW_ID/messages/` directory and replaced with a pointer.
+Living words use a separate variant:
+
+```clojure
+#psyche ["FLOW_ID" "context first" "verbatim words"]
+```
+
+Context always precedes the verbatim field. The verbatim field is serialized
+exactly, including newlines and Unicode; it is never summarized or truncated.
+Both variants may exceed Claude's paste threshold. Messenger sends the whole
+tagged envelope into the pane and accepts Claude's `pasted_content` wrapper.
+The ledger records the variant, the exact input fields, and the exact envelope
+submitted to Herdr.
+
+Pass only the body to `hm-send` or `messenger-clj send`. A field that parses as
+one complete `#msg` or `#psyche` form is rejected. Ordinary prose may mention
+either tag. There is no overflow file or pointer path.
 
 ## Use
 
@@ -41,6 +53,7 @@ During development, the Bash launcher runs Babashka against the source tree:
 ```sh
 bin/messenger-clj --help
 FLOW_ID=<self> bin/messenger-clj send TARGET 'text'
+FLOW_ID=<self> bin/messenger-clj send TARGET --psyche 'why these words matter' 'verbatim words'
 ```
 
 The `hm-*` scripts are development compatibility launchers. JSON migration is
@@ -67,12 +80,9 @@ The final typed state root is `~/.local/state/messenger-clj`. `HM_REGISTRY` may
 select another root for tests and isolated operation. The old Python source and
 JSON state are retained only as frozen migration inputs.
 
-The currently installed 9176503a launcher still selects the transitional
-`~/.local/state/hacky-messenger-clojure` root. Deployment must hold
-Orchestrate locks over both roots, stop concurrent messenger invocations, move
-the database once, and replace every installed launcher in the same managed
-Home activation. Moving the database before that activation would let the old
-launcher recreate the old root and split authority.
+The installed launcher and this source select the typed state root
+`~/.local/state/messenger-clj`. Deployment replaces the package target behind
+all nine `hm-*` aliases atomically and does not move or rewrite that database.
 
 Concurrent operations use unique Orchestrate lock names against the same state
 path. A competing operation waits for that path lock for a bounded interval;

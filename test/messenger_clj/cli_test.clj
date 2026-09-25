@@ -112,26 +112,36 @@
         (is (str/includes? (:out sent) "Transported.{ 00f95a working }"))
         (is (some #(= :Submitting (:reason %)) (store/attempts-for root "00f95a"))))
       (let [short-body "one\ntwo\nλ"
-            long-body (apply str (repeat 900 "λ"))
+            long-body (str "line 1\n" (apply str (repeat 12000 "λ🙂"))
+                           "\n<pasted_content id=\"abc\">whole</pasted_content>")
+            context "context first\nwith UTF-8: 世界"
+            verbatim (str "  verbatim starts\n" (apply str (repeat 5000 "ψ")) "\nverbatim ends  ")
             short-send (invoke environment "hm-send" "00f95a" short-body)
             long-send (invoke environment "hm-send" "00f95a" long-body)
+            psyche-send (invoke environment "hm-send" "00f95a" "--psyche" context verbatim)
             lines (str/split-lines (slurp prompt-log))
             values (mapv read-string lines)
-            pointer (second (last values))
-            path (second (re-find #"read (.+) in full\." pointer))]
+            attempts (store/attempts-for root "00f95a")]
         (is (zero? (:exit short-send)) (:err short-send))
         (is (zero? (:exit long-send)) (:err long-send))
-        (is (= 3 (count lines)))
-        (is (every? #(and (<= (count %) 800) (not (str/includes? % "\n"))) lines))
-        (is (every? #(str/starts-with? % "#msg [") lines))
-        (is (every? #(and (= 2 (count %)) (string? (first %)) (string? (second %))) values))
-        (is (= ["sender" "one two λ"] (second values)))
-        (is (= (str long-body "\n") (slurp path)))
-        (is (str/starts-with? path (str (fs/path root "flows" "sender" "messages"))))
-        (is (= #{short-body long-body}
+        (is (zero? (:exit psyche-send)) (:err psyche-send))
+        (is (= 4 (count lines)))
+        (is (> (count (nth lines 2)) 800))
+        (is (> (count (nth lines 3)) 800))
+        (is (= ["sender" short-body] (second values)))
+        (is (= ["sender" long-body] (nth values 2)))
+        (is (= ["sender" context verbatim] (nth values 3)))
+        (is (not-any? #(str/includes? % "Message too long for a pane") lines))
+        (is (= #{short-body long-body verbatim}
                (set (keep :body (filter #(and (contains? #{:Submitting :sent} (:reason %))
                                               (not= "isolated-success" (:body %)))
-                                        (store/attempts-for root "00f95a")))))))
+                                        attempts)))))
+        (let [psyche-attempts (filter #(= :psyche (:variant %)) attempts)
+              expected (hm/message-envelope "sender" {:variant :psyche :context context :body verbatim})]
+          (is (= 2 (count psyche-attempts)))
+          (is (every? #(= context (:context %)) psyche-attempts))
+          (is (every? #(= verbatim (:body %)) psyche-attempts))
+          (is (every? #(= expected (:submitted %)) psyche-attempts))))
       (let [moved (invoke environment "hm-move" "00f95a" "w2"
                           "--session" "s" "--pane-id" "p" "--terminal-id" "t"
                           "--name" "Mind Sol 00f95a" "--agent" "codex"

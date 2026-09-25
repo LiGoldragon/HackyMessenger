@@ -4014,10 +4014,13 @@
 (def Attempt
   [:map {:closed true}
    [:id :string] [:flow :string] [:at :string] [:grade {:optional true} :keyword] [:reason :keyword]
-   [:body {:optional true} :string] [:binding {:optional true} AttemptBinding]])
+   [:variant {:optional true} [:enum :msg :psyche]]
+   [:context {:optional true} :string] [:body {:optional true} :string]
+   [:submitted {:optional true} :string] [:binding {:optional true} AttemptBinding]])
 (def Pending
   [:map {:closed true}
-   [:attempt Attempt] [:message :string] [:state [:= "held"]]])
+   [:attempt Attempt] [:message :string] [:variant {:optional true} [:enum :msg :psyche]]
+   [:context {:optional true} :string] [:state [:= "held"]]])
 (def RouteIdentity
   [:map {:closed true}
    [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string]])
@@ -4039,7 +4042,8 @@
    :route/readiness-kind {}
    :attempt/id {:db/unique :db.unique/identity}
    :attempt/flow {:db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
-   :attempt/at {} :attempt/grade {} :attempt/reason {} :attempt/body {}
+   :attempt/at {} :attempt/grade {} :attempt/reason {} :attempt/variant {}
+   :attempt/context {} :attempt/body {} :attempt/submitted {}
    :attempt.binding/session {} :attempt.binding/name {} :attempt.binding/pane {}
    :attempt.binding/terminal {} :attempt.binding/agent {} :attempt.binding/thread {}
    :attempt.binding/hold {} :attempt.binding/transition {} :attempt.binding/state {}
@@ -4047,7 +4051,7 @@
    :attempt.binding/readiness-marker {} :attempt.binding/readiness-kind {}
    :pending/id {:db/unique :db.unique/identity}
    :pending/attempt {:db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
-   :pending/message {} :pending/state {}
+   :pending/message {} :pending/variant {} :pending/context {} :pending/state {}
    :retirement/flow {:db/valueType :db.type/ref :db/cardinality :db.cardinality/one
                      :db/unique :db.unique/identity}
    :retirement/version {} :retirement/state {} :retirement/session {}
@@ -4169,7 +4173,8 @@
    :route/readiness-rollout :route/readiness-marker :route/readiness-kind
    {:route/flow [:flow/id]}])
 (def attempt-pull
-  [:attempt/id :attempt/at :attempt/grade :attempt/reason :attempt/body
+  [:attempt/id :attempt/at :attempt/grade :attempt/reason :attempt/variant
+   :attempt/context :attempt/body :attempt/submitted
    :attempt.binding/session :attempt.binding/name :attempt.binding/pane
    :attempt.binding/terminal :attempt.binding/agent :attempt.binding/thread
    :attempt.binding/hold :attempt.binding/transition :attempt.binding/state
@@ -4177,7 +4182,8 @@
    :attempt.binding/readiness-marker :attempt.binding/readiness-kind
    {:attempt/flow [:flow/id]}])
 (def pending-pull
-  [:pending/message :pending/state {:pending/attempt attempt-pull}])
+  [:pending/message :pending/variant :pending/context :pending/state
+   {:pending/attempt attempt-pull}])
 (def retirement-pull
   [:retirement/version :retirement/state :retirement/session :retirement/name
    :retirement/pane :retirement/terminal :retirement/agent :retirement/thread
@@ -4238,7 +4244,10 @@
      (cond-> {:attempt/id (:id attempt) :attempt/flow [:flow/id (:flow attempt)]
               :attempt/at (:at attempt) :attempt/reason (:reason attempt)}
        (:grade attempt) (assoc :attempt/grade (:grade attempt))
+       (:variant attempt) (assoc :attempt/variant (:variant attempt))
+       (:context attempt) (assoc :attempt/context (:context attempt))
        (:body attempt) (assoc :attempt/body (:body attempt))
+       (:submitted attempt) (assoc :attempt/submitted (:submitted attempt))
        (:binding attempt) (merge (binding-attrs (:binding attempt))))]))
 (defn put-attempt! [root attempt]
   (let [attempt (attempt! attempt)] (transact! root (attempt-tx attempt)) attempt))
@@ -4250,7 +4259,10 @@
      (cond-> {:id (:attempt/id entity) :flow flow :at (:attempt/at entity)
               :reason (:attempt/reason entity)}
        (:attempt/grade entity) (assoc :grade (:attempt/grade entity))
+       (:attempt/variant entity) (assoc :variant (:attempt/variant entity))
+       (:attempt/context entity) (assoc :context (:attempt/context entity))
        (:attempt/body entity) (assoc :body (:attempt/body entity))
+       (:attempt/submitted entity) (assoc :submitted (:attempt/submitted entity))
        (some #(contains? entity %)
              [:attempt.binding/session :attempt.binding/name :attempt.binding/pane
               :attempt.binding/terminal :attempt.binding/agent :attempt.binding/thread])
@@ -4273,15 +4285,20 @@
   (let [pending (pending! pending) attempt (:attempt pending)]
     (when-not (attempt-by-id root (:id attempt))
       (throw (ex-info "Pending intent requires a persisted attempt" {:attempt (:id attempt)})))
-    (transact! root [{:pending/id (:id attempt)
-                      :pending/attempt [:attempt/id (:id attempt)]
-                      :pending/message (:message pending) :pending/state (:state pending)}])
+    (transact! root [(cond-> {:pending/id (:id attempt)
+                              :pending/attempt [:attempt/id (:id attempt)]
+                              :pending/message (:message pending)
+                              :pending/state (:state pending)}
+                       (:variant pending) (assoc :pending/variant (:variant pending))
+                       (:context pending) (assoc :pending/context (:context pending)))])
     pending))
 (defn- pulled-pending! [entity]
   (when-not (map? (:pending/attempt entity))
     (throw (ex-info "Malformed pending attempt reference" {:entity entity})))
-  (pending! {:attempt (pulled-attempt! (:pending/attempt entity))
-             :message (:pending/message entity) :state (:pending/state entity)}))
+  (pending! (cond-> {:attempt (pulled-attempt! (:pending/attempt entity))
+                     :message (:pending/message entity) :state (:pending/state entity)}
+              (:pending/variant entity) (assoc :variant (:pending/variant entity))
+              (:pending/context entity) (assoc :context (:pending/context entity)))))
 (defn pending-by-id [root id]
   (some-> (query root '[:find (pull ?pending ?pattern)
                         :in $ ?id ?pattern :where [?pending :pending/id ?id]]
@@ -4785,11 +4802,7 @@
                     :empty-retired-by (:empty-retired-by report)}]
         (pr-str output)))))
 (ns messenger-clj.core
-  (:import [java.io PushbackReader StringReader]
-           [java.nio ByteBuffer]
-           [java.nio.channels FileChannel]
-           [java.nio.file Files OpenOption StandardCopyOption StandardOpenOption]
-           [java.nio.file.attribute PosixFilePermissions])
+  (:import [java.io PushbackReader StringReader])
   (:require [babashka.fs :as fs]
             [cheshire.core :as json]
             [babashka.process :refer [shell]]
@@ -4803,17 +4816,20 @@
 (def delivery-grades #{:Transported :Presented :Fallback-Presented :Held :Uncertain})
 (def FlowId [:and [:string {:min 1 :max 96}] [:re #"^[A-Za-z0-9][A-Za-z0-9_-]*$"]])
 (def NativeThread [:and [:string {:min 16 :max 96}] [:re #"^[A-Za-z0-9-]+$"]])
-(def MessageBody [:string {:min 1 :max 65536}])
+(def MessageBody [:string {:min 1}])
+(def MessageVariant [:enum :msg :psyche])
 (def ReadinessProof [:map {:closed true} [:thread_id NativeThread] [:rollout :string] [:marker :string] [:evidence_kind {:optional true} :string]])
 (def RouteBinding [:map {:closed true} [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string] [:native_thread {:optional true} NativeThread] [:readiness_proof {:optional true} ReadinessProof] [:route_hold {:optional true} :string] [:transition {:optional true} :boolean] [:state {:optional true} :string]])
-(def DeliveryAttempt [:map {:closed true} [:id :string] [:at :string] [:flow FlowId] [:reason :keyword] [:grade {:optional true} :keyword] [:body {:optional true} MessageBody] [:binding {:optional true} RouteBinding]])
-(def PendingIntent [:map {:closed true} [:attempt DeliveryAttempt] [:message MessageBody] [:state [:= "held"]]])
+(def DeliveryAttempt [:map {:closed true} [:id :string] [:at :string] [:flow FlowId] [:reason :keyword] [:grade {:optional true} :keyword] [:variant {:optional true} MessageVariant] [:context {:optional true} MessageBody] [:body {:optional true} MessageBody] [:submitted {:optional true} :string] [:binding {:optional true} RouteBinding]])
+(def PendingIntent [:map {:closed true} [:attempt DeliveryAttempt] [:message MessageBody] [:variant {:optional true} MessageVariant] [:context {:optional true} MessageBody] [:state [:= "held"]]])
 (def RouteIdentity [:map {:closed true} [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string]])
 (def RetirementEvidence [:map {:closed true} [:path :string] [:sha256 [:re #"^[0-9a-f]{64}$"]]])
 (def RetirementMarker [:map {:closed true} [:version [:= 1]] [:state [:= "retired"]] [:flow FlowId] [:record RouteIdentity] [:native_thread NativeThread] [:evidence RetirementEvidence] [:retired_by :string] [:retired_at :string]])
 (def Reservation [:map {:closed true} [:id :int] [:flow FlowId] [:root :string]])
 (def PaneMessage [:tuple FlowId MessageBody])
-(doseq [schema [FlowId NativeThread MessageBody ReadinessProof RouteBinding DeliveryAttempt PendingIntent RetirementMarker Reservation PaneMessage]] (m/validator schema))
+(def PsycheMessage [:tuple FlowId MessageBody MessageBody])
+(def MessageRequest [:map {:closed true} [:variant MessageVariant] [:body MessageBody] [:context {:optional true} MessageBody]])
+(doseq [schema [FlowId NativeThread MessageBody MessageVariant ReadinessProof RouteBinding DeliveryAttempt PendingIntent RetirementMarker Reservation PaneMessage PsycheMessage MessageRequest]] (m/validator schema))
 
 (defn fail [s] (throw (ex-info s {:hm/failure true})))
 (defn valid! [schema value label] (if (m/validate schema value) value (fail (str "Invalid " label ": " (pr-str (m/explain schema value))))))
@@ -4871,6 +4887,8 @@
   ;; `data_readers.clj` binds #msg to this function for Clojure readers.  The
   ;; tagged value is deliberately just the two pane-visible fields.
   (valid! PaneMessage value "#msg"))
+(defn read-psyche [value]
+  (valid! PsycheMessage value "#psyche"))
 (defn- read-complete [readers line]
   (with-open [reader (PushbackReader. (StringReader. line))]
     (let [eof (Object.)
@@ -4883,71 +4901,33 @@
   (let [tagged ::tagged
         value (read-complete {'msg #(hash-map tagged (read-msg %))} line)]
     (or (get value tagged) (fail "Expected one complete #msg form"))))
-(defn relay-line [sender _recipient body]
-  (let [message (read-msg [sender body])
-        line (str "#msg " (pr-str message))]
-    (when-not (= message (read-pane-message line))
-      (fail "#msg EDN round trip failed; message held"))
-    line))
-(defn relay [sender recipient body]
-  (let [line (relay-line sender recipient body)]
-    (when (or (str/includes? line "\n") (> (count line) 800))
-      (fail "#msg EDN must be one line of at most 800 characters; message held"))
-    line))
-(defn primary-root []
-  (fs/absolutize (or (System/getenv "HM_PRIMARY_ROOT")
-                     (str (fs/path (System/getProperty "user.home") "primary")))))
-(defn- set-posix-permissions! [path permissions]
-  (Files/setPosixFilePermissions (fs/path path) (PosixFilePermissions/fromString permissions)))
-(defn- sync-directory! [directory]
-  (with-open [channel (FileChannel/open (fs/path directory)
-                                        (into-array OpenOption [StandardOpenOption/READ]))]
-    (.force channel true)))
-(defn durable-write! [path content]
-  (let [path (fs/path path)
-        directory (fs/parent path)
-        temporary (fs/path directory (str "." (fs/file-name path) "." (java.util.UUID/randomUUID) ".tmp"))]
-    (fs/create-dirs directory)
-    (set-posix-permissions! directory "rwx------")
-    (try
-      (with-open [channel (FileChannel/open (fs/path temporary)
-                                            (into-array OpenOption
-                                                        [StandardOpenOption/CREATE_NEW
-                                                         StandardOpenOption/WRITE]))]
-        (let [bytes (ByteBuffer/wrap (.getBytes content java.nio.charset.StandardCharsets/UTF_8))]
-          (while (.hasRemaining bytes) (.write channel bytes)))
-        (.force channel true))
-      (set-posix-permissions! temporary "rw-------")
-      (Files/move (fs/path temporary) (fs/path path)
-                  (into-array StandardCopyOption
-                              [StandardCopyOption/ATOMIC_MOVE StandardCopyOption/REPLACE_EXISTING]))
-      (sync-directory! directory)
-      (str (fs/absolutize path))
-      (finally (fs/delete-if-exists temporary)))))
-(defn write-overflow! [sender recipient body]
+(defn read-psyche-message [line]
+  (let [tagged ::tagged
+        value (read-complete {'psyche #(hash-map tagged (read-psyche %))} line)]
+    (or (get value tagged) (fail "Expected one complete #psyche form"))))
+(defn request! [request]
+  (let [request (valid! MessageRequest request "MessageRequest")]
+    (when (and (= :psyche (:variant request)) (not (contains? request :context)))
+      (fail "Psyche messages require context"))
+    (when (and (= :msg (:variant request)) (contains? request :context))
+      (fail "Machine messages do not carry psyche context"))
+    request))
+(defn message-envelope [sender request]
   (flow-id! sender)
-  (flow-id! recipient)
-  (let [stamp (str/replace (now) #"[^A-Za-z0-9]+" "-")
-        path (fs/path (primary-root) "flows" sender "messages"
-                      (str stamp "-" recipient "-" (java.util.UUID/randomUUID) ".md"))
-        content (if (str/ends-with? body "\n") body (str body "\n"))]
-    (durable-write! path content)))
-(defn pasted-content-marker? [body]
-  (or (str/includes? body "<pasted_content")
-      (str/includes? body "</pasted_content>")))
-(defn framed-text [sender recipient body]
-  (let [lines (str/split body #"\n" -1)
-        collapsed (str/replace body "\n" " ")
-        direct (relay-line sender recipient collapsed)]
-    (if (and (<= (count lines) 3)
-             (<= (count direct) 800)
-             (not (pasted-content-marker? body)))
-      (relay sender recipient collapsed)
-      (let [path (write-overflow! sender recipient body)
-            pointer (str "Message too long for a pane; read " path " in full.")]
-        (relay sender recipient pointer)))))
+  (let [{:keys [variant context body]} (request! request)
+        [tag value reader] (case variant
+                             :msg ["#msg" (read-msg [sender body]) read-pane-message]
+                             :psyche ["#psyche" (read-psyche [sender context body]) read-psyche-message])
+        envelope (str tag " " (pr-str value))]
+    (when-not (= value (reader envelope))
+      (fail (str tag " EDN round trip failed; message held")))
+    envelope))
+(defn relay-line [sender _recipient body] (message-envelope sender {:variant :msg :body body}))
+(defn relay [sender recipient body] (relay-line sender recipient body))
+(defn framed-text [sender _recipient body] (message-envelope sender {:variant :msg :body body}))
 (defn nested-relay? [body]
-  (try (read-pane-message body) true (catch Exception _ false)))
+  (or (try (read-pane-message body) true (catch Exception _ false))
+      (try (read-psyche-message body) true (catch Exception _ false))))
 (defn read-route [flow]
   (try
     (if-let [route (load-route (registry) flow)]
@@ -5132,9 +5112,12 @@
     :else [(fallback-route flow nil nil) true]))
 (defn in-transition? [route] (or (:transition route) (= "transition" (:state route))))
 (defn needs-binding? [route] (= "NeedsBinding" (:state route)))
-(defn append-attempt! [flow reason grade route body]
+(defn attempt-fields [request submitted]
+  (cond-> (select-keys (request! request) [:variant :context :body])
+    submitted (assoc :submitted submitted)))
+(defn append-attempt! [flow reason grade route request submitted]
   (let [attempt (cond-> {:id (str (java.util.UUID/randomUUID)) :at (now) :flow flow :reason reason :grade grade}
-                  body (assoc :body body)
+                  request (merge (attempt-fields request submitted))
                   route (assoc :binding route))]
     (delivery-attempt! attempt)
     (record-attempt! (or *ledger* (->DatalevinLedger (root))) attempt)
@@ -5148,10 +5131,10 @@
   (let [message (.getMessage error)
         candidate (keyword (or message ""))]
     (if (contains? failure-reasons candidate) candidate :PaneMissing)))
-(defn record-uncertain! [flow route body]
+(defn record-uncertain! [flow route request submitted]
   ;; The pre-prompt record is already durable.  Keep the original uncertainty
   ;; if storage is unavailable while recording this post-submit observation.
-  (try (append-attempt! flow :Uncertain :Uncertain route body) (catch Exception _ nil)))
+  (try (append-attempt! flow :Uncertain :Uncertain route request submitted) (catch Exception _ nil)))
 (defn contention? [reply]
   (boolean (re-find #"LockRejected\.(?:DuplicateName|PathConflict|PathOverlap)|(?:DuplicateName|PathConflict|PathOverlap)"
                     (str (:out reply) "\n" (:err reply)))))
@@ -5195,15 +5178,22 @@
   (record-attempt! [_ attempt]
     (store/put-attempt! state-root attempt)
     attempt)
-  (record-pending! [_ attempt body]
-    (store/put-pending! state-root
-                        (valid! PendingIntent {:attempt attempt :message body :state "held"}
-                                "PendingIntent"))
+  (record-pending! [_ attempt request]
+    (let [{:keys [variant context body]} (request! request)]
+      (store/put-pending! state-root
+                          (valid! PendingIntent
+                                  (cond-> {:attempt attempt :message body :variant variant :state "held"}
+                                    context (assoc :context context))
+                                  "PendingIntent")))
     attempt))
-(defn held! [flow reason body route]
-  (let [attempt (append-attempt! flow reason :Held route body)
-        pending (valid! PendingIntent {:attempt attempt :message body :state "held"} "PendingIntent")]
-    (record-pending! (or *ledger* (->DatalevinLedger (root))) attempt body)
+(defn held! [flow reason request route]
+  (let [{:keys [variant context body]} (request! request)
+        attempt (append-attempt! flow reason :Held route request nil)
+        pending (valid! PendingIntent
+                        (cond-> {:attempt attempt :message body :variant variant :state "held"}
+                          context (assoc :context context))
+                        "PendingIntent")]
+    (record-pending! (or *ledger* (->DatalevinLedger (root))) attempt request)
     (when-not *ledger*
       (when-not (= pending (store/pending-by-id (root) (:id attempt)))
         (fail "Pending ledger index did not confirm persistence")))
@@ -5393,24 +5383,30 @@
                       (fail (str "Move failed; terminal was returned to original workspace with new pane ID: " (.getMessage error))))))))))))))
 (def abrupt-keys {"codex" {:interrupt ["esc"] :submit []}
                   "claude" {:interrupt ["esc" "esc"] :submit ["enter"]}})
-(defn send-abrupt! [flow body wait-presented]
-  (flow-id! flow) (valid! MessageBody body "MessageBody")
-  (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))
-  (when (nested-relay? body) (fail "Nested #msg is not a message body"))
+(defn validate-request! [request]
+  (let [{:keys [context body] :as request} (request! request)
+        values (cond-> [body] context (conj context))]
+    (when (some #(or (str/blank? %) (re-find #"[\p{Cc}&&[^\n\t]]" %)) values)
+      (fail "Message fields must be nonempty and contain no terminal control characters"))
+    (when (some nested-relay? values)
+      (fail "Nested complete #msg or #psyche form is not a message field"))
+    request))
+(defn send-abrupt-request! [flow request wait-presented]
+  (flow-id! flow)
+  (let [request (validate-request! request)]
   (let [sender (or *flow-id* (System/getenv "FLOW_ID") (fail "Set FLOW_ID to your own flow ID before sending"))]
     (with-reservation flow
       (fn []
         (assert-not-retired! flow)
         (let [route (read-route flow)]
-          (when (needs-binding? route) (held! flow :NeedsBinding body route))
-          (when (in-transition? route) (held! flow :InTransition body route))
-          (when (:route_hold route) (held! flow :RouteHold body route))
-          (let [live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) body route)))
+          (when (needs-binding? route) (held! flow :NeedsBinding request route))
+          (when (in-transition? route) (held! flow :InTransition request route))
+          (when (:route_hold route) (held! flow :RouteHold request route))
+          (let [live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) request route)))
                 keys (get abrupt-keys (:agent route))]
             (when-not keys (fail (str "Hard-abrupt is not supported for " (:agent route) "; nothing sent")))
-            (let [envelope (try (framed-text sender flow body)
-                                (catch Exception _ (held! flow :RelayOverflow body route)))
-                  submission (append-attempt! flow :Submitting :Uncertain route body)]
+            (let [envelope (message-envelope sender request)
+                  submission (append-attempt! flow :Submitting :Uncertain route request envelope)]
               (try
                 (doseq [key (:interrupt keys)] (send-keys* (transport) route key))
                 (let [reply (prompt!* (transport) route envelope wait-presented)]
@@ -5420,32 +5416,35 @@
               ;; Recheck before reporting any delivery grade.
                 (verify-target! route)
                 (try
-                  (append-attempt! flow :sent (if wait-presented :Presented :Transported) route body)
+                  (append-attempt! flow :sent (if wait-presented :Presented :Transported) route request envelope)
                   (str (if wait-presented "Presented" "Transported") ".{ " flow " " (or (:agent_status live) "unknown") " }")
                   (catch Exception error
-                    (record-uncertain! flow route body)
+                    (record-uncertain! flow route request envelope)
                     (throw (ex-info (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } prompt was delivered but ledger confirmation failed; do not retry: " (.getMessage error))
                                     {:hm/failure true :hm/post-ledger true}))))
                 (catch Exception error
                   (if (:hm/post-ledger (ex-data error))
                     (throw error)
-                    (do (record-uncertain! flow route body)
-                        (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } Escape was sent; prompt failed or is uncertain: " (.getMessage error))))))))))))))
-(defn record-sent! [flow grade route submission live body]
+                    (do (record-uncertain! flow route request envelope)
+                        (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } Escape was sent; prompt failed or is uncertain: " (.getMessage error)))))))))))))))
+(defn send-abrupt! [flow body wait-presented]
+  (send-abrupt-request! flow {:variant :msg :body body} wait-presented))
+(defn send-abrupt-psyche! [flow context verbatim wait-presented]
+  (send-abrupt-request! flow {:variant :psyche :context context :body verbatim} wait-presented))
+(defn record-sent! [flow grade route submission live request envelope]
   (try
-    (append-attempt! flow :sent grade route body)
+    (append-attempt! flow :sent grade route request envelope)
     (str (name grade) ".{ " flow " " (or (:agent_status live) "unknown") " }")
     (catch Exception error
-      (record-uncertain! flow route body)
+      (record-uncertain! flow route request envelope)
       (throw (ex-info (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12)
                            " } prompt was delivered but ledger confirmation failed; do not retry: " (.getMessage error))
                       {:hm/failure true :hm/post-ledger true})))))
-(defn send!
-  ([flow body wait-presented pane] (send! flow body wait-presented pane 10))
-  ([flow body wait-presented pane hold-seconds]
-   (flow-id! flow) (valid! MessageBody body "MessageBody")
-   (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))
-   (when (nested-relay? body) (fail "Nested #msg is not a message body"))
+(defn send-request!
+  ([flow request wait-presented pane] (send-request! flow request wait-presented pane 10))
+  ([flow request wait-presented pane hold-seconds]
+   (flow-id! flow)
+   (let [request (validate-request! request)]
    (let [sender (or *flow-id* (System/getenv "FLOW_ID") (fail "Set FLOW_ID to your own flow ID before sending"))]
      (with-reservation flow
        (fn []
@@ -5455,27 +5454,36 @@
                         (do (Thread/sleep (long (* 1000 hold-seconds)))
                             (try (read-route flow) (catch Exception _ nil)))
                         stored)]
-           (when (in-transition? stored) (held! flow :InTransition body stored))
-           (when (needs-binding? stored) (held! flow :NeedsBinding body stored))
-           (when (:route_hold stored) (held! flow :RouteHold body stored))
+           (when (in-transition? stored) (held! flow :InTransition request stored))
+           (when (needs-binding? stored) (held! flow :NeedsBinding request stored))
+           (when (:route_hold stored) (held! flow :RouteHold request stored))
            (let [[route fallback?] (try (resolve-send-route flow stored pane)
-                                        (catch Exception _ (held! flow (if stored :PaneMissing :NotRegistered) body stored)))
-                 live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) body route)))
-                 envelope (try (framed-text sender flow body) (catch Exception _ (held! flow :RelayOverflow body route)))
-                 submission (append-attempt! flow :Submitting :Uncertain route body)
+                                        (catch Exception _ (held! flow (if stored :PaneMissing :NotRegistered) request stored)))
+                 live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) request route)))
+                 envelope (message-envelope sender request)
+                 submission (append-attempt! flow :Submitting :Uncertain route request envelope)
                  grade (if fallback? :Fallback-Presented (if wait-presented :Presented :Transported))]
              (try
                (let [waited? (or fallback? wait-presented)
                      reply (prompt!* (transport) route envelope waited?)]
                  (when waited? (presented! reply)))
                (verify-target! route)
-               (record-sent! flow grade route submission live body)
+               (record-sent! flow grade route submission live request envelope)
                (catch Exception error
                  (if (:hm/post-ledger (ex-data error))
                    (throw error)
-                   (do (record-uncertain! flow route body)
+                   (do (record-uncertain! flow route request envelope)
                        (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12)
-                                  " } prompt failed or is uncertain: " (.getMessage error))))))))))))))
+                                  " } prompt failed or is uncertain: " (.getMessage error)))))))))))))))
+(defn send!
+  ([flow body wait-presented pane] (send-request! flow {:variant :msg :body body} wait-presented pane))
+  ([flow body wait-presented pane hold-seconds]
+   (send-request! flow {:variant :msg :body body} wait-presented pane hold-seconds)))
+(defn send-psyche!
+  ([flow context verbatim wait-presented pane]
+   (send-request! flow {:variant :psyche :context context :body verbatim} wait-presented pane))
+  ([flow context verbatim wait-presented pane hold-seconds]
+   (send-request! flow {:variant :psyche :context context :body verbatim} wait-presented pane hold-seconds)))
 (defn route-records []
   (into {} (remove (fn [[flow _]] (store/retirement-for (root) flow))
                    (store/routes (root)))))
@@ -5510,7 +5518,10 @@
 (ns messenger-clj.main
   (:require [messenger-clj.core :as hm]
             [messenger-clj.legacy-import :as legacy]))
-(defn usage [] (str "Usage: messenger-clj <send|send-abrupt|register|deregister|rebind|move|retire|import-retirement|import-json|heartbeat-state|list> ...\n" hm/skill-note))
+(defn usage [] (str "Usage: messenger-clj <send|send-abrupt|register|deregister|rebind|move|retire|import-retirement|import-json|heartbeat-state|list> ...\n"
+                    "  messenger-clj send TARGET BODY [--wait-presented] [--hold-seconds N] [--pane SESSION:PANE]\n"
+                    "  messenger-clj send TARGET --psyche CONTEXT VERBATIM [--wait-presented] [--hold-seconds N] [--pane SESSION:PANE]\n"
+                    hm/skill-note))
 (defn arg [xs option] (second (drop-while #(not= option %) xs)))
 (defn parse-error [message] (throw (ex-info message {:hm/parse true})))
 (def value-options #{"--session" "--native-thread" "--readiness-probe" "--rollout" "--old-name" "--pane-id" "--terminal-id" "--name" "--agent" "--process-pid" "--evidence" "--evidence-sha256" "--hold-seconds" "--pane" "--target" "--receipt"})
@@ -5521,7 +5532,7 @@
     (loop [remaining xs positional [] options []]
       (if-let [value (first remaining)]
         (cond
-          (contains? #{"--wait-presented" "--apply"} value) (recur (next remaining) positional (conj options value))
+          (contains? #{"--wait-presented" "--apply" "--psyche"} value) (recur (next remaining) positional (conj options value))
           (contains? value-options value) (if-let [argument (second remaining)]
                                             (recur (nnext remaining) positional (into options [value argument]))
                                             (parse-error (str "argument " value ": expected one argument")))
@@ -5532,7 +5543,7 @@
   (loop [remaining xs]
     (when-let [value (first remaining)]
       (cond
-        (contains? #{"--wait-presented" "--apply"} value) (recur (next remaining))
+        (contains? #{"--wait-presented" "--apply" "--psyche"} value) (recur (next remaining))
         (contains? value-options value) (recur (nnext remaining))
         (contains? allowed value) (recur (next remaining))
         :else (parse-error (str "unrecognized arguments: " value))))))
@@ -5546,22 +5557,40 @@
       (if (or (= op "--help") (= op "-h") (some #{"--help" "-h"} xs))
         (println (usage))
         (case op
-          "send" (let [[flow body & rest] xs]
-                   (when-not (and flow body) (parse-error "the following arguments are required: flow, message"))
-                   (unknown-flags! rest #{"--wait-presented" "--hold-seconds" "--pane"})
-                   (extra-values! rest #{"--wait-presented" "--hold-seconds" "--pane"})
+          "send" (let [psyche? (boolean (some #{"--psyche"} xs))
+                       [flow first-field second-field & tail] xs
+                       [context body rest] (if psyche?
+                                             [first-field second-field tail]
+                                             [nil first-field (if (nil? second-field) tail (cons second-field tail))])]
+                   (when-not (and flow body (or (not psyche?) context))
+                     (parse-error (if psyche?
+                                    "the following arguments are required: flow, --psyche, context, verbatim"
+                                    "the following arguments are required: flow, message")))
+                   (unknown-flags! rest #{"--psyche" "--wait-presented" "--hold-seconds" "--pane"})
+                   (extra-values! rest #{"--psyche" "--wait-presented" "--hold-seconds" "--pane"})
                    (let [hold (try (Double/parseDouble (or (arg rest "--hold-seconds") "10"))
                                    (catch Exception _ (parse-error "argument --hold-seconds: invalid float value")))]
                      (when-not (<= 0 hold 60) (hm/fail "--hold-seconds must be between 0 and 60"))
-                     (println (hm/send! flow body (boolean (some #{"--wait-presented"} rest)) (arg rest "--pane") hold))))
-          "send-abrupt" (let [[flow body & rest] xs]
-                          (when-not (and flow body) (parse-error "the following arguments are required: flow, message"))
-                          (unknown-flags! rest #{"--wait-presented" "--hold-seconds"})
-                          (extra-values! rest #{"--wait-presented" "--hold-seconds"})
+                     (println (if psyche?
+                                (hm/send-psyche! flow context body (boolean (some #{"--wait-presented"} rest)) (arg rest "--pane") hold)
+                                (hm/send! flow body (boolean (some #{"--wait-presented"} rest)) (arg rest "--pane") hold)))))
+          "send-abrupt" (let [psyche? (boolean (some #{"--psyche"} xs))
+                              [flow first-field second-field & tail] xs
+                              [context body rest] (if psyche?
+                                                    [first-field second-field tail]
+                                                    [nil first-field (if (nil? second-field) tail (cons second-field tail))])]
+                          (when-not (and flow body (or (not psyche?) context))
+                            (parse-error (if psyche?
+                                           "the following arguments are required: flow, --psyche, context, verbatim"
+                                           "the following arguments are required: flow, message")))
+                          (unknown-flags! rest #{"--psyche" "--wait-presented" "--hold-seconds"})
+                          (extra-values! rest #{"--psyche" "--wait-presented" "--hold-seconds"})
                           (let [hold (try (Double/parseDouble (or (arg rest "--hold-seconds") "10"))
                                           (catch Exception _ (parse-error "argument --hold-seconds: invalid float value")))]
                             (when-not (<= 0 hold 60) (hm/fail "--hold-seconds must be between 0 and 60")))
-                          (println (hm/send-abrupt! flow body (boolean (some #{"--wait-presented"} rest)))))
+                          (println (if psyche?
+                                     (hm/send-abrupt-psyche! flow context body (boolean (some #{"--wait-presented"} rest)))
+                                     (hm/send-abrupt! flow body (boolean (some #{"--wait-presented"} rest))))))
           "register" (let [[flow name & rest] xs session (arg rest "--session") thread (arg rest "--native-thread")
                            marker (arg rest "--readiness-probe") rollout (arg rest "--rollout")]
                        (when-not (and flow name) (parse-error "the following arguments are required: flow, name"))

@@ -57,52 +57,43 @@
   (with-redefs [hm/live-agents (constantly [(assoc route :name "A 00f95a") (assoc route :name "B 00f95a")])]
     (is (thrown? Exception (hm/resolve-send-route "00f95a" nil nil)))))
 
-(deftest relay-is-a-bounded-edn-round-trip
+(deftest machine-relay-is-an-unchanged-edn-round-trip
   (let [line (hm/relay "00f95a" "e51411" "receipt")
         value (hm/read-pane-message line)]
-    (is (<= (count line) 800))
-    (is (not (.contains line "\n")))
     (is (= "#msg [\"00f95a\" \"receipt\"]" line))
     (is (= ["00f95a" "receipt"] value))
     (is (= value (read-string line)))))
 
-(deftest framed-text-is-one-line-edn-and-durably-points-to-overflow
-  (let [primary (str (fs/create-temp-dir {:prefix "hm-primary-"}))
-        fixed-clock (reify hm/Clock (current-time [_] "2026-09-25T00:00:00Z"))]
-    (binding [hm/*clock* fixed-clock]
-      (with-redefs [hm/primary-root (constantly primary)]
-        (let [short-line (hm/framed-text "sender" "00f95a" "one\ntwo\nλ")
-              short-value (hm/read-pane-message short-line)]
-          (is (<= (count short-line) 800))
-          (is (not (str/includes? short-line "\n")))
-          (is (= ["sender" "one two λ"] short-value)))
-        (let [overhead (dec (count (hm/relay-line "sender" "00f95a" "x")))
-              exact-body (apply str (repeat (- 800 overhead) "x"))
-              exact-line (hm/framed-text "sender" "00f95a" exact-body)]
-          (is (= 800 (count exact-line)))
-          (is (= ["sender" exact-body] (hm/read-pane-message exact-line))))
-        (doseq [body [(apply str (repeat 900 "λ"))
-                      "one\ntwo\nthree\nfour"
-                      "literal <pasted_content> wrapper"]]
-          (let [line (hm/framed-text "sender" "00f95a" body)
-                pointer (second (hm/read-pane-message line))
-                path (second (re-find #"read (.+) in full\." pointer))]
-            (is (<= (count line) 800))
-            (is (not (str/includes? line "\n")))
-            (is (not (str/includes? line "<pasted_content")))
-            (is (not (str/starts-with? line "Machine.Relay.{")))
-            (is (str/starts-with? path (str (fs/path primary "flows" "sender" "messages"))))
-            (is (= (if (str/ends-with? body "\n") body (str body "\n"))
-                   (slurp path)))))))))
+(deftest large-multiline-utf8-and-pasted-content-are-sent-whole
+  (let [body (str "first\n" (apply str (repeat 12000 "λ🙂"))
+                  "\n<pasted_content id=\"abc\">verbatim</pasted_content>")
+        line (hm/message-envelope "sender" {:variant :msg :body body})]
+    (is (> (count line) 800))
+    (is (= ["sender" body] (hm/read-pane-message line)))
+    (is (str/includes? line "pasted_content"))))
+
+(deftest psyche-edn-round-trip-keeps-context-before-verbatim-exactly
+  (let [context "why this matters\nwith detail"
+        verbatim " living's λ words\nexactly  "
+        line (hm/message-envelope "e51411" {:variant :psyche :context context :body verbatim})]
+    (is (str/starts-with? line "#psyche [\"e51411\""))
+    (is (= ["e51411" context verbatim] (hm/read-psyche-message line)))
+    (is (= ["e51411" context verbatim] (read-string line)))))
 
 (deftest nested-pane-message-is-rejected-before-send
-  (is (re-find #"Nested #msg"
-               (try (hm/send! "00f95a" "#msg [\"sender\" \"body\"]" false nil)
+  (let [secret "DIAGNOSTIC_SECRET_7391"
+        diagnostic (try (hm/send! "00f95a" (str "#msg [\"sender\" \"" secret "\"]") false nil)
+                        (catch Exception error (.getMessage error)))]
+    (is (re-find #"Nested complete #msg or #psyche" diagnostic))
+    (is (not (str/includes? diagnostic secret))))
+  (is (re-find #"Nested complete #msg or #psyche"
+               (try (hm/send-psyche! "00f95a" "context" "#psyche [\"sender\" \"c\" \"v\"]" false nil)
                     (catch Exception error (.getMessage error))))))
 
 (deftest closed-core-records-and-deep-relays-are-rejected
   (is (false? (malli.core/validate hm/RouteBinding (assoc route :unexpected true))))
   (is (hm/nested-relay? "#msg [\"sender\" \"body\"]"))
+  (is (hm/nested-relay? "#psyche [\"sender\" \"context\" \"words\"]"))
   (is (false? (hm/nested-relay? "prose mentioning #msg is allowed")))
   (is (false? (hm/nested-relay? "Machine.Relay.{ relayed }")))
   (is (false? (hm/nested-relay? "#msg [\"sender\" \"body\"] trailing")))
@@ -357,11 +348,10 @@
     (is (= "Transported.{ 00f95a working }" (send-result good-agent good-process)))
     (is (= 1 @prompts))))
 
-(deftest held-routes-overflow-write-errors-and-post-prompt-ledger-failure-are-honest
+(deftest held-routes-large-bodies-and-post-prompt-ledger-failure-are-honest
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-p0-"}))
-        primary (str (fs/create-temp-dir {:prefix "hm-primary-p0-"}))
         prompts (atom 0)
-        overflow-body (apply str (repeat 790 "x"))
+        large-body (str "line one\n" (apply str (repeat 12000 "λ")))
         good-agent (assoc route :interactive_ready true :agent_status "working")
         process [{:argv ["codex" "--thread" (:native_thread route)]}]
         transport (fake-transport good-agent good-agent process prompts)]
@@ -370,18 +360,20 @@
       (is (re-find #"RouteHold" (try (hm/send! "00f95a" "body" false nil) (catch Exception error (.getMessage error)))))
       (is (re-find #"RouteHold" (try (hm/send-abrupt! "00f95a" "body" false) (catch Exception error (.getMessage error)))))
       (is (zero? @prompts))
+      (let [pending (first (store/pending-for root-path "00f95a"))]
+        (is (= :msg (:variant pending)))
+        (is (= "body" (:message pending))))
       (persist-route! root-path route)
-      (with-redefs [hm/durable-write! (fn [& _] (hm/fail "disk unavailable"))]
-        (is (re-find #"RelayOverflow" (try (hm/send! "00f95a" overflow-body false nil) (catch Exception error (.getMessage error))))))
-      (let [pending (first (filter #(= overflow-body (:message %))
-                                   (store/pending-for root-path "00f95a")))]
-        (is (= overflow-body (:message pending)))
-        (is (= overflow-body (get-in pending [:attempt :body]))))
-      (with-redefs [hm/primary-root (constantly primary)]
-        (is (= "Transported.{ 00f95a working }" (hm/send! "00f95a" overflow-body false nil))))
-      (is (= #{overflow-body}
+      (is (= "Transported.{ 00f95a working }" (hm/send! "00f95a" large-body false nil)))
+      (is (= #{large-body}
              (set (keep :body (filter #(contains? #{:Submitting :sent} (:reason %))
                                       (store/attempts-for root-path "00f95a"))))))
+      (is (every? #(= :msg (:variant %))
+                  (filter #(contains? #{:Submitting :sent} (:reason %))
+                          (store/attempts-for root-path "00f95a"))))
+      (is (every? #(= (hm/message-envelope "sender" {:variant :msg :body large-body}) (:submitted %))
+                  (filter #(contains? #{:Submitting :sent} (:reason %))
+                          (store/attempts-for root-path "00f95a"))))
       (let [writes (atom 0)
             ledger (reify hm/Ledger
                      (record-attempt! [_ _] (if (= 2 (swap! writes inc)) (hm/fail "sent ledger unavailable") :ok))

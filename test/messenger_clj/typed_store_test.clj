@@ -54,6 +54,19 @@
         (is (= pending (typed/pending-by-id root "attempt-1")))
         (is (= [pending] (typed/pending-for root flow)))))))
 
+(deftest real-pod-roundtrips-psyche-variant-and-exact-submission
+  (with-temp-store
+    (fn [root]
+      (let [submitted "#psyche [\"sender\" \"context\" \"verbatim λ\"]"
+            psyche (assoc attempt :id "attempt-psyche" :variant :psyche
+                          :context "context" :body "verbatim λ" :submitted submitted)
+            pending {:attempt psyche :message "verbatim λ" :variant :psyche
+                     :context "context" :state "held"}]
+        (typed/put-attempt! root psyche)
+        (typed/put-pending! root pending)
+        (is (= psyche (typed/attempt-by-id root "attempt-psyche")))
+        (is (= pending (typed/pending-by-id root "attempt-psyche")))))))
+
 (deftest retirement-preserves-evidence-and-wins-over-a-route
   (with-temp-store
     (fn [root]

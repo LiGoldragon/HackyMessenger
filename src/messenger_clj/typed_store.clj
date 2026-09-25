@@ -40,10 +40,13 @@
 (def Attempt
   [:map {:closed true}
    [:id :string] [:flow :string] [:at :string] [:grade {:optional true} :keyword] [:reason :keyword]
-   [:body {:optional true} :string] [:binding {:optional true} AttemptBinding]])
+   [:variant {:optional true} [:enum :msg :psyche]]
+   [:context {:optional true} :string] [:body {:optional true} :string]
+   [:submitted {:optional true} :string] [:binding {:optional true} AttemptBinding]])
 (def Pending
   [:map {:closed true}
-   [:attempt Attempt] [:message :string] [:state [:= "held"]]])
+   [:attempt Attempt] [:message :string] [:variant {:optional true} [:enum :msg :psyche]]
+   [:context {:optional true} :string] [:state [:= "held"]]])
 (def RouteIdentity
   [:map {:closed true}
    [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string]])
@@ -65,7 +68,8 @@
    :route/readiness-kind {}
    :attempt/id {:db/unique :db.unique/identity}
    :attempt/flow {:db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
-   :attempt/at {} :attempt/grade {} :attempt/reason {} :attempt/body {}
+   :attempt/at {} :attempt/grade {} :attempt/reason {} :attempt/variant {}
+   :attempt/context {} :attempt/body {} :attempt/submitted {}
    :attempt.binding/session {} :attempt.binding/name {} :attempt.binding/pane {}
    :attempt.binding/terminal {} :attempt.binding/agent {} :attempt.binding/thread {}
    :attempt.binding/hold {} :attempt.binding/transition {} :attempt.binding/state {}
@@ -73,7 +77,7 @@
    :attempt.binding/readiness-marker {} :attempt.binding/readiness-kind {}
    :pending/id {:db/unique :db.unique/identity}
    :pending/attempt {:db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
-   :pending/message {} :pending/state {}
+   :pending/message {} :pending/variant {} :pending/context {} :pending/state {}
    :retirement/flow {:db/valueType :db.type/ref :db/cardinality :db.cardinality/one
                      :db/unique :db.unique/identity}
    :retirement/version {} :retirement/state {} :retirement/session {}
@@ -195,7 +199,8 @@
    :route/readiness-rollout :route/readiness-marker :route/readiness-kind
    {:route/flow [:flow/id]}])
 (def attempt-pull
-  [:attempt/id :attempt/at :attempt/grade :attempt/reason :attempt/body
+  [:attempt/id :attempt/at :attempt/grade :attempt/reason :attempt/variant
+   :attempt/context :attempt/body :attempt/submitted
    :attempt.binding/session :attempt.binding/name :attempt.binding/pane
    :attempt.binding/terminal :attempt.binding/agent :attempt.binding/thread
    :attempt.binding/hold :attempt.binding/transition :attempt.binding/state
@@ -203,7 +208,8 @@
    :attempt.binding/readiness-marker :attempt.binding/readiness-kind
    {:attempt/flow [:flow/id]}])
 (def pending-pull
-  [:pending/message :pending/state {:pending/attempt attempt-pull}])
+  [:pending/message :pending/variant :pending/context :pending/state
+   {:pending/attempt attempt-pull}])
 (def retirement-pull
   [:retirement/version :retirement/state :retirement/session :retirement/name
    :retirement/pane :retirement/terminal :retirement/agent :retirement/thread
@@ -264,7 +270,10 @@
      (cond-> {:attempt/id (:id attempt) :attempt/flow [:flow/id (:flow attempt)]
               :attempt/at (:at attempt) :attempt/reason (:reason attempt)}
        (:grade attempt) (assoc :attempt/grade (:grade attempt))
+       (:variant attempt) (assoc :attempt/variant (:variant attempt))
+       (:context attempt) (assoc :attempt/context (:context attempt))
        (:body attempt) (assoc :attempt/body (:body attempt))
+       (:submitted attempt) (assoc :attempt/submitted (:submitted attempt))
        (:binding attempt) (merge (binding-attrs (:binding attempt))))]))
 (defn put-attempt! [root attempt]
   (let [attempt (attempt! attempt)] (transact! root (attempt-tx attempt)) attempt))
@@ -276,7 +285,10 @@
      (cond-> {:id (:attempt/id entity) :flow flow :at (:attempt/at entity)
               :reason (:attempt/reason entity)}
        (:attempt/grade entity) (assoc :grade (:attempt/grade entity))
+       (:attempt/variant entity) (assoc :variant (:attempt/variant entity))
+       (:attempt/context entity) (assoc :context (:attempt/context entity))
        (:attempt/body entity) (assoc :body (:attempt/body entity))
+       (:attempt/submitted entity) (assoc :submitted (:attempt/submitted entity))
        (some #(contains? entity %)
              [:attempt.binding/session :attempt.binding/name :attempt.binding/pane
               :attempt.binding/terminal :attempt.binding/agent :attempt.binding/thread])
@@ -299,15 +311,20 @@
   (let [pending (pending! pending) attempt (:attempt pending)]
     (when-not (attempt-by-id root (:id attempt))
       (throw (ex-info "Pending intent requires a persisted attempt" {:attempt (:id attempt)})))
-    (transact! root [{:pending/id (:id attempt)
-                      :pending/attempt [:attempt/id (:id attempt)]
-                      :pending/message (:message pending) :pending/state (:state pending)}])
+    (transact! root [(cond-> {:pending/id (:id attempt)
+                              :pending/attempt [:attempt/id (:id attempt)]
+                              :pending/message (:message pending)
+                              :pending/state (:state pending)}
+                       (:variant pending) (assoc :pending/variant (:variant pending))
+                       (:context pending) (assoc :pending/context (:context pending)))])
     pending))
 (defn- pulled-pending! [entity]
   (when-not (map? (:pending/attempt entity))
     (throw (ex-info "Malformed pending attempt reference" {:entity entity})))
-  (pending! {:attempt (pulled-attempt! (:pending/attempt entity))
-             :message (:pending/message entity) :state (:pending/state entity)}))
+  (pending! (cond-> {:attempt (pulled-attempt! (:pending/attempt entity))
+                     :message (:pending/message entity) :state (:pending/state entity)}
+              (:pending/variant entity) (assoc :variant (:pending/variant entity))
+              (:pending/context entity) (assoc :context (:pending/context entity)))))
 (defn pending-by-id [root id]
   (some-> (query root '[:find (pull ?pending ?pattern)
                         :in $ ?id ?pattern :where [?pending :pending/id ?id]]
