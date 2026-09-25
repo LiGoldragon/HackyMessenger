@@ -72,3 +72,13 @@
     (when-let [[session pane terminal agent thread hold state] (first rows)]
       (route! {:flow/id flow :route/session session :route/pane pane :route/terminal terminal :route/agent agent
                :route/thread thread :route/hold hold :route/state state}))))
+(defn attempts-for [root flow]
+  (let [rows (checked-rows! (query root '[:find ?id ?at ?grade ?reason :in $ ?flow
+                                          :where [?f :flow/id ?flow] [?a :attempt/flow ?f] [?a :attempt/id ?id]
+                                          [?a :attempt/at ?at] [?a :attempt/grade ?grade] [?a :attempt/reason ?reason]] flow) 4)]
+    (mapv (fn [[id at grade reason]] (attempt! {:attempt/id id :attempt/flow flow :attempt/at at :attempt/grade grade :attempt/reason reason})) rows)))
+(defn retirements-for [root flow]
+  (let [rows (checked-rows! (query root '[:find ?evidence ?at ?by :in $ ?flow
+                                          :where [?f :flow/id ?flow] [?r :retirement/flow ?f]
+                                          [?r :retirement/evidence ?evidence] [?r :retirement/at ?at] [?r :retirement/retired-by ?by]] flow) 3)]
+    (mapv (fn [[evidence at by]] (retirement! {:retirement/flow flow :retirement/evidence evidence :retirement/at at :retirement/retired-by by})) rows)))
