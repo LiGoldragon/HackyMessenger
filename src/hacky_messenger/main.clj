@@ -27,6 +27,12 @@
           "list" (println (hm/listing!))
           (parse-error (str "invalid choice: " op)))))
     (catch clojure.lang.ExceptionInfo e
-      (binding [*out* *err*] (println (if (:hm/parse (ex-data e)) (str "usage: " (usage) "hm-clj: error: " (.getMessage e)) (str "hm: " (.getMessage e))))
-               (System/exit (if (:hm/parse (ex-data e)) 2 1)))
-      (catch Exception e (binding [*out* *err*] (println "hm:" (.getMessage e))) (System/exit 1)))))
+      (binding [*out* *err*]
+        (println (if (:hm/parse (ex-data e))
+                   (str "usage: " (usage) "hm-clj: error: " (.getMessage e))
+                   (str "hm: " (.getMessage e))))
+        (System/exit (if (:hm/parse (ex-data e)) 2 1))))
+    (catch Exception e
+      (binding [*out* *err*]
+        (println "hm:" (.getMessage e))
+        (System/exit 1)))))
