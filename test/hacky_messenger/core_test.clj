@@ -70,6 +70,11 @@
                (try (hm/send! "00f95a" (pr-str {:machine/relay ["machine" "sender" "heard" "seat" ["00f95a"] "body" ""]}) false nil)
                     (catch Exception error (.getMessage error))))))
 
+(deftest closed-core-records-and-deep-relays-are-rejected
+  (is (false? (malli.core/validate hm/RouteBinding (assoc route :unexpected true))))
+  (is (hm/nested-relay? (pr-str [{:machine/relay ["machine" "sender" "heard" "seat" ["00f95a"] "body" ""]}])))
+  (is (hm/nested-relay? "Machine.Relay.{ relayed }")))
+
 (deftest abrupt-send-is-durable-gated-and-agent-specific
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-abrupt-"}))
         process [{:argv ["codex" "--thread" (:native_thread route)]}]

@@ -13,14 +13,14 @@
 (def FlowId [:and [:string {:min 1 :max 96}] [:re #"^[A-Za-z0-9][A-Za-z0-9_-]*$"]])
 (def NativeThread [:and [:string {:min 16 :max 96}] [:re #"^[A-Za-z0-9-]+$"]])
 (def MessageBody [:string {:min 1 :max 65536}])
-(def ReadinessProof [:map [:thread_id NativeThread] [:rollout :string] [:marker :string]])
-(def RouteBinding [:map [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string] [:native_thread NativeThread] [:readiness_proof {:optional true} ReadinessProof]])
-(def DeliveryAttempt [:map [:id :string] [:at :string] [:flow FlowId] [:reason :keyword] [:grade {:optional true} :keyword] [:binding {:optional true} RouteBinding]])
-(def PendingIntent [:map [:attempt DeliveryAttempt] [:message MessageBody] [:state [:= "held"]]])
-(def RouteIdentity [:map [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string]])
-(def RetirementEvidence [:map [:path :string] [:sha256 [:re #"^[0-9a-f]{64}$"]]])
-(def RetirementMarker [:map [:version [:= 1]] [:state [:= "retired"]] [:flow FlowId] [:record RouteIdentity] [:native_thread NativeThread] [:evidence RetirementEvidence]])
-(def Reservation [:map [:id :int] [:flow FlowId] [:root :string]])
+(def ReadinessProof [:map {:closed true} [:thread_id NativeThread] [:rollout :string] [:marker :string] [:evidence_kind {:optional true} :string]])
+(def RouteBinding [:map {:closed true} [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string] [:native_thread NativeThread] [:readiness_proof {:optional true} ReadinessProof] [:route_hold {:optional true} :string] [:transition {:optional true} :boolean] [:state {:optional true} :string]])
+(def DeliveryAttempt [:map {:closed true} [:id :string] [:at :string] [:flow FlowId] [:reason :keyword] [:grade {:optional true} :keyword] [:binding {:optional true} RouteBinding]])
+(def PendingIntent [:map {:closed true} [:attempt DeliveryAttempt] [:message MessageBody] [:state [:= "held"]]])
+(def RouteIdentity [:map {:closed true} [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string]])
+(def RetirementEvidence [:map {:closed true} [:path :string] [:sha256 [:re #"^[0-9a-f]{64}$"]]])
+(def RetirementMarker [:map {:closed true} [:version [:= 1]] [:state [:= "retired"]] [:flow FlowId] [:record RouteIdentity] [:native_thread NativeThread] [:evidence RetirementEvidence]])
+(def Reservation [:map {:closed true} [:id :int] [:flow FlowId] [:root :string]])
 (def MachineRelay [:tuple :string FlowId :string :string [:vector FlowId] MessageBody :string])
 (doseq [schema [FlowId NativeThread MessageBody ReadinessProof RouteBinding DeliveryAttempt PendingIntent RetirementMarker Reservation MachineRelay]] (m/validator schema))
 
@@ -83,10 +83,12 @@
       (fail "Machine.Relay EDN round trip failed; message held"))
     line))
 (defn nested-relay? [body]
-  (try
-    (let [value (edn/read-string body)]
-      (and (map? value) (contains? value :machine/relay)))
-    (catch Exception _ false)))
+  (or (str/includes? body "Machine.Relay.{")
+      (try
+        (let [value (edn/read-string body)]
+          (boolean (some #(and (map? %) (contains? % :machine/relay))
+                         (tree-seq coll? seq value))))
+        (catch Exception _ false))))
 (defn atomic-edn! [destination value]
   (fs/create-dirs (fs/parent destination))
   (let [tmp (fs/path (str destination ".tmp"))]
@@ -144,12 +146,21 @@
     (let [other (fs/strip-ext (fs/file-name marker))]
       (when (and (not= flow other) (= native-thread (:native_thread (retirement! other))))
         (fail (str "Native thread " native-thread " is retired as Flow " other "; use a fresh native session"))))))
+(defn claude-session-matches? [process native]
+  (and (int? (:pid process))
+       (try
+         (let [file (fs/path (System/getProperty "user.home") ".claude" "sessions" (str (:pid process) ".json"))
+               value (json/parse-string (slurp (str file)) true)]
+           (= native (:sessionId value)))
+         (catch Exception _ false))))
 (defn process-matches! [route]
   (let [reply (process-info* (transport) route)
         info (or (:process_info reply) reply)
         processes (:foreground_processes info)
         native (native-thread! (:native_thread route))]
-    (when-not (some #(str/includes? (str/join " " (map str (or (:argv %) []))) native) processes)
+    (when-not (some #(or (str/includes? (str/join " " (map str (or (:argv %) []))) native)
+                         (and (= "claude" (:agent route)) (claude-session-matches? % native)))
+                    processes)
       (fail "ProcessMismatch"))))
 (defn content-text [content]
   (cond
@@ -220,6 +231,7 @@
                (not= (:native_thread route) (get-in route [:readiness_proof :thread_id])))
       (fail "NotReady"))
     (when (= "blocked" (:agent_status agent)) (fail "Blocked"))
+    (when-not (contains? #{"idle" "working" "done"} (:agent_status agent)) (fail "Uncertain"))
     (process-matches! route)
     agent))
 (defn shell-live-agents []
@@ -258,6 +270,7 @@
     (and stored (exact-live-route? stored)) [stored false]
     stored [(fallback-route flow stored nil) true]
     :else [(fallback-route flow nil nil) true]))
+(defn in-transition? [route] (or (:transition route) (= "transition" (:state route))))
 (defn append-attempt! [flow reason grade route]
   (let [attempt (cond-> {:id (str (java.util.UUID/randomUUID)) :at (now) :flow flow :reason reason :grade grade}
                   route (assoc :binding route))]
@@ -500,34 +513,35 @@
     (with-reservation flow
       (fn []
         (assert-not-retired! flow)
-        (let [route (read-route flow)
-              _ (when (:route_hold route) (held! flow :RouteHold body route))
-              live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) body route)))
-              keys (get abrupt-keys (:agent route))]
-          (when-not keys (fail (str "Hard-abrupt is not supported for " (:agent route) "; nothing sent")))
-          (let [envelope (try (relay sender flow body)
-                              (catch Exception _ (held! flow :RelayOverflow body route)))
-                submission (append-attempt! flow :Submitting :Uncertain route)]
-            (try
-              (doseq [key (:interrupt keys)] (send-keys* (transport) route key))
-              (let [reply (prompt!* (transport) route envelope wait-presented)]
-                (when wait-presented (presented! reply)))
-              (doseq [key (:submit keys)] (send-keys* (transport) route key))
+        (let [route (read-route flow)]
+          (when (in-transition? route) (held! flow :InTransition body route))
+          (when (:route_hold route) (held! flow :RouteHold body route))
+          (let [live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) body route)))
+                keys (get abrupt-keys (:agent route))]
+            (when-not keys (fail (str "Hard-abrupt is not supported for " (:agent route) "; nothing sent")))
+            (let [envelope (try (relay sender flow body)
+                                (catch Exception _ (held! flow :RelayOverflow body route)))
+                  submission (append-attempt! flow :Submitting :Uncertain route)]
+              (try
+                (doseq [key (:interrupt keys)] (send-keys* (transport) route key))
+                (let [reply (prompt!* (transport) route envelope wait-presented)]
+                  (when wait-presented (presented! reply)))
+                (doseq [key (:submit keys)] (send-keys* (transport) route key))
               ;; A successful prompt does not prove the terminal stayed bound.
               ;; Recheck before reporting any delivery grade.
-              (verify-target! route)
-              (try
-                (append-attempt! flow :sent (if wait-presented :Presented :Transported) route)
-                (str (if wait-presented "Presented" "Transported") ".{ " flow " " (or (:agent_status live) "unknown") " }")
+                (verify-target! route)
+                (try
+                  (append-attempt! flow :sent (if wait-presented :Presented :Transported) route)
+                  (str (if wait-presented "Presented" "Transported") ".{ " flow " " (or (:agent_status live) "unknown") " }")
+                  (catch Exception error
+                    (record-uncertain! flow route)
+                    (throw (ex-info (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } prompt was delivered but ledger confirmation failed; do not retry: " (.getMessage error))
+                                    {:hm/failure true :hm/post-ledger true}))))
                 (catch Exception error
-                  (record-uncertain! flow route)
-                  (throw (ex-info (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } prompt was delivered but ledger confirmation failed; do not retry: " (.getMessage error))
-                                  {:hm/failure true :hm/post-ledger true}))))
-              (catch Exception error
-                (if (:hm/post-ledger (ex-data error))
-                  (throw error)
-                  (do (record-uncertain! flow route)
-                      (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } Escape was sent; prompt failed or is uncertain: " (.getMessage error)))))))))))))
+                  (if (:hm/post-ledger (ex-data error))
+                    (throw error)
+                    (do (record-uncertain! flow route)
+                        (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } Escape was sent; prompt failed or is uncertain: " (.getMessage error))))))))))))))
 (defn record-sent! [flow grade route submission live]
   (try
     (append-attempt! flow :sent grade route)
@@ -546,6 +560,7 @@
       (fn []
         (assert-not-retired! flow)
         (let [stored (try (read-route flow) (catch Exception _ nil))]
+          (when (in-transition? stored) (held! flow :InTransition body stored))
           (when (:route_hold stored) (held! flow :RouteHold body stored))
           (let [[route fallback?] (try (resolve-send-route flow stored pane)
                                        (catch Exception _ (held! flow (if stored :PaneMissing :NotRegistered) body stored)))
