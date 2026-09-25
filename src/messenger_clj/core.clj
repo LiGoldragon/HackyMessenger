@@ -1,4 +1,4 @@
-(ns hacky-messenger.core
+(ns messenger-clj.core
   (:import [java.io PushbackReader StringReader]
            [java.nio ByteBuffer]
            [java.nio.channels FileChannel]
@@ -9,10 +9,10 @@
             [babashka.process :refer [shell]]
             [clojure.edn :as edn]
             [clojure.string :as str]
-            [hacky-messenger.typed-store :as store]
+            [messenger-clj.typed-store :as store]
             [malli.core :as m]))
 
-(def skill-note "Documented by the compensation-hacky-messenger skill (Curriculum skills/compensation-hacky-messenger.md). Update that skill with any change to this tool.")
+(def skill-note "Documented by the authored messaging skills in Curriculum. Update those sources with any change to this tool.")
 (def failure-reasons #{:NotRegistered :NeedsBinding :InTransition :RouteHold :IdentityChanged :PaneMissing :NotReady :Blocked :ProcessMismatch :Stalled :Uncertain :RelayOverflow :Submitting :sent})
 (def delivery-grades #{:Transported :Presented :Fallback-Presented :Held :Uncertain})
 (def FlowId [:and [:string {:min 1 :max 96}] [:re #"^[A-Za-z0-9][A-Za-z0-9_-]*$"]])
@@ -71,7 +71,8 @@
 ;; `with-reservation` below; tests supply a short-lived in-memory lease.
 (def ^:dynamic *with-reservation* nil)
 (defn root []
-  ;; Clojure Datalevin state never shares Python's JSON registry.
+  ;; Keep the deployed typed state path stable across the repository rename.
+  ;; It never shares Python's JSON registry.
   (fs/absolutize (or *root* (System/getenv "HM_REGISTRY")
                      (str (fs/path (System/getProperty "user.home") ".local/state/hacky-messenger-clojure")))))
 (defn registry [] (or *registry* (->DatalevinRegistry (root))))
@@ -366,7 +367,7 @@
   (let [owner (flow-id! (or *flow-id* (System/getenv "FLOW_ID") flow))
         reply (shell {:out :string :err :string :continue true :timeout 15000}
                      "orchestrate"
-                     (str "Lock.{ HackyMessengerDelivery " owner " [ " (quote-datom (root)) " ] «Register or submit through Herdr» }"))
+                     (str "Lock.{ MessengerCljDelivery " owner " [ " (quote-datom (root)) " ] «Register or submit through Herdr» }"))
         match (re-find #"Locked\.\{\s+(\d+)\b" (:out reply))]
     (when-not (and (zero? (:exit reply)) match)
       (fail (str "Reservation refused: " (str/trim (or (not-empty (:out reply)) (:err reply) "")))))

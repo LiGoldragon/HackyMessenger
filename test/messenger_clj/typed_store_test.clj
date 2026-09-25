@@ -1,7 +1,7 @@
-(ns hacky-messenger.typed-store-test
+(ns messenger-clj.typed-store-test
   (:require [babashka.fs :as fs]
             [clojure.test :refer [deftest is testing]]
-            [hacky-messenger.typed-store :as typed]))
+            [messenger-clj.typed-store :as typed]))
 
 (def flow "00f95a")
 (def route

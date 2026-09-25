@@ -1,4 +1,4 @@
-(ns hacky-messenger.legacy-import
+(ns messenger-clj.legacy-import
   "Offline, one-way conversion of the legacy Python JSON registry into the
   typed Datalevin registry. Source bytes are read once, validated completely,
   and represented by a digest manifest before an optional apply."
@@ -9,7 +9,7 @@
             [clojure.edn :as edn]
             [clojure.set :as set]
             [clojure.string :as str]
-            [hacky-messenger.typed-store :as store]))
+            [messenger-clj.typed-store :as store]))
 
 (def flow-pattern #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}")
 (def attempt-pattern #"[0-9a-f]{32}")

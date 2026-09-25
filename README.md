@@ -1,35 +1,10 @@
-# Hacky Messenger
+# messenger-clj
 
-Hacky Messenger (HM) is the live compensation layer for messaging between
-flows in Herdr. The installed commands resolve a Flow ID to its current pane,
-check the route and native harness identity, and prompt that pane. Flow Nexus
-and Message Nexus are intended to replace it.
+`messenger-clj` is the standalone Clojure command line messenger for live Flow
+routes in Herdr. It resolves a Flow ID to its registered pane, checks the route
+and native harness identity, and prompts that pane exactly once.
 
-## What the recipient sees
-
-HM types exactly one line of tagged EDN into the target pane:
-
-```clojure
-#msg ["FLOW_ID" "text"]
-```
-
-The vector contains only the sender's Flow ID and the message text. Time,
-recipient, harness kind, route identity, delivery attempts, pending messages,
-and retirements belong to the typed Datalevin ledger and do not appear in the
-pane message.
-
-HM constructs this envelope. Pass only the body to `hm-send`; never place one
-complete tagged message inside another. A body that parses as exactly one
-complete `#msg` form is rejected. Ordinary prose may mention `#msg`.
-
-The pane line is at most 800 characters and contains no newline. HM collapses
-up to three short body lines. Longer content is written under the sender's
-`flows/FLOW_ID/messages/` directory and the tagged message carries a short
-instruction to read that file.
-
-## Commands
-
-Nine unprefixed commands on `PATH` run the typed Clojure implementation:
+The public compatibility commands remain available:
 
 ```text
 hm-send          hm-send-abrupt
@@ -39,37 +14,62 @@ hm-move          hm-retire
 hm-heartbeat-state
 ```
 
-`FLOW_ID=<self> hm-send TARGET 'text'` is the ordinary send. `hm-send-abrupt`
-interrupts the current turn before prompting. The registry commands require
-the exact live or stale route identity shown by Herdr; use their `--help`
-output and the `compensation-hacky-messenger` Curriculum skill for the full
-arguments and receipt meanings.
+They invoke the same `messenger-clj` program and the same typed Datalevin
+ledger. There is no Python runtime fallback.
 
-`hm-heartbeat-state` takes no message body or other arguments. It reads the
-typed store and prints a read-only view of current routes and retirements for
-the heartbeat consumer; it does not send or mutate a message.
+## Message shape
 
-The Clojure-only maintenance commands are exposed with the `hm-clj-` prefix:
-`hm-clj-import-json` and `hm-clj-import-retirement`.
+The recipient sees one line of tagged EDN:
 
-## Authority and storage
+```clojure
+#msg ["FLOW_ID" "text"]
+```
 
-The live Clojure state root defaults to
-`~/.local/state/hacky-messenger-clojure` and may be set with `HM_REGISTRY`.
-Datalevin is authoritative for routes, attempts, pending messages, and
-retirements. The legacy Python and JSON files remain only for migration and
-historical checks; the installed unprefixed commands do not target them.
+The vector contains the sender Flow ID and the message text. Time, recipient,
+harness kind, route identity, delivery attempts, pending messages, and
+retirements stay in the typed ledger.
 
-The installed launchers live under
-`~/.local/libexec/hacky-messenger-clojure/`. The source is this repository's
-`clojure` branch. Every HM behavior change must update the authored
-`skills/compensation-hacky-messenger.md` in Curriculum in the same landing.
+Pass only the body to `hm-send` or `messenger-clj send`. A body that parses as
+one complete `#msg` form is rejected. Ordinary prose may mention `#msg`.
+Messages longer than the one line pane limit are written under the sender's
+`flows/FLOW_ID/messages/` directory and replaced with a pointer.
 
-## Checks
+## Use
+
+During development, the Bash launcher runs Babashka against the source tree:
+
+```sh
+bin/messenger-clj --help
+FLOW_ID=<self> bin/messenger-clj send TARGET 'text'
+```
+
+The `hm-*` scripts are development compatibility launchers. JSON migration is
+available only through `messenger-clj import-json`; it is not an operational
+authority or fallback.
+
+The Nix package installs the compiled Babashka uberscript, a pinned Datalevin
+pod, `messenger-clj`, and the nine `hm-*` command links:
+
+```sh
+nix build
+nix run . -- --help
+nix flake check
+```
+
+## State continuity
+
+The typed state root stays at
+`~/.local/state/hacky-messenger-clojure` so the repository rename does not
+split the live registry or ledger. `HM_REGISTRY` may select another root for
+tests and isolated operation. The old Python source and JSON state are retained
+only as frozen migration inputs.
+
+## Clojure tests
 
 ```sh
 bb --config bb.edn -e \
-  '(require '\''hacky-messenger.core-test '\''hacky-messenger.cli-test '\''hacky-messenger.typed-store-test '\''hacky-messenger.legacy-import-test) (apply clojure.test/run-tests ['\''hacky-messenger.core-test '\''hacky-messenger.cli-test '\''hacky-messenger.typed-store-test '\''hacky-messenger.legacy-import-test])'
+  '(require '\''messenger-clj.core-test '\''messenger-clj.cli-test '\''messenger-clj.typed-store-test '\''messenger-clj.legacy-import-test) (apply clojure.test/run-tests ['\''messenger-clj.core-test '\''messenger-clj.cli-test '\''messenger-clj.typed-store-test '\''messenger-clj.legacy-import-test])'
 ```
 
-The test suite uses fake Herdr boundaries and temporary Datalevin stores.
+The suite uses fake Herdr boundaries and temporary Datalevin stores. It never
+sends to a live route.

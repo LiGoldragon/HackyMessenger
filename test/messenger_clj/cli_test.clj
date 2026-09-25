@@ -1,13 +1,13 @@
-(ns hacky-messenger.cli-test
+(ns messenger-clj.cli-test
   (:require [babashka.fs :as fs]
             [babashka.process :refer [shell]]
             [clojure.edn :as edn]
             [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [cheshire.core :as json]
-            [hacky-messenger.core :as hm]
-            [hacky-messenger.legacy-import-test :as legacy-test]
-            [hacky-messenger.typed-store :as store]))
+            [messenger-clj.core :as hm]
+            [messenger-clj.legacy-import-test :as legacy-test]
+            [messenger-clj.typed-store :as store]))
 
 (def native-thread "00000000-0000-0000-0000-000000000000")
 
@@ -39,9 +39,9 @@
     (let [{:keys [root tools prompt-log environment]} (fake-herdr-environment)
           env (assoc environment "FAKE_HERDR_WAIT" wait-result)]
       (try
-        (is (zero? (:exit (invoke env "hm-clj-register" "00f95a" "Mind Sol 00f95a"
+        (is (zero? (:exit (invoke env "hm-register" "00f95a" "Mind Sol 00f95a"
                                   "--session" "s" "--native-thread" native-thread))))
-        (let [sent (invoke env "hm-clj-send" "00f95a" (str "wait-" wait-result) "--wait-presented")
+        (let [sent (invoke env "hm-send" "00f95a" (str "wait-" wait-result) "--wait-presented")
               attempts (store/attempts-for root "00f95a")]
           (is (= expected-exit (:exit sent)) (str wait-result ": " (:err sent)))
           (is (str/includes? (str (:out sent) (:err sent)) (name expected-grade)))
@@ -60,11 +60,11 @@
   (let [{:keys [source]} (legacy-test/fixture!)
         target (str (fs/path (fs/create-temp-dir {:prefix "hm-cli-import-target-"}) "target"))
         receipt (str (fs/path (fs/create-temp-dir {:prefix "hm-cli-import-receipt-"}) "receipt.edn"))
-        dry-run (invoke {} "hm-clj-import-json" source "--target" target "--receipt" receipt)]
+        dry-run (invoke {} "messenger-clj" "import-json" source "--target" target "--receipt" receipt)]
     (is (zero? (:exit dry-run)) (:err dry-run))
     (is (= :dry-run (:mode (edn/read-string (str/trim (:out dry-run))))))
     (is (not (fs/exists? (store/database-path target))))
-    (let [applied (invoke {} "hm-clj-import-json" source "--target" target "--receipt" receipt "--apply")]
+    (let [applied (invoke {} "messenger-clj" "import-json" source "--target" target "--receipt" receipt "--apply")]
       (is (zero? (:exit applied)) (:err applied))
       (is (= :applied (:mode (edn/read-string (str/trim (:out applied))))))
       (is (= "NeedsBinding" (:state (store/route-for target "beta")))))))
@@ -91,14 +91,14 @@
       (.setExecutable (java.io.File. (str orchestrate)) true)
       (spit (str evidence) "retirement witness")
 
-      (let [registered (invoke environment "hm-clj-register" "00f95a" "Mind Sol 00f95a"
+      (let [registered (invoke environment "hm-register" "00f95a" "Mind Sol 00f95a"
                                "--session" "s" "--native-thread" native-thread)]
         (is (zero? (:exit registered)) (:err registered))
         (is (str/includes? (:out registered) "Registered 00f95a")))
-      (let [listed (invoke environment "hm-clj-list")]
+      (let [listed (invoke environment "hm-list")]
         (is (zero? (:exit listed)) (:err listed))
         (is (str/includes? (:out listed) "00f95a\tMind Sol 00f95a\ts\tworking")))
-      (let [snapshot (invoke environment "hm-clj-heartbeat-state")
+      (let [snapshot (invoke environment "hm-heartbeat-state")
             value (json/parse-string (:out snapshot) true)]
         (is (zero? (:exit snapshot)) (:err snapshot))
         (is (= 1 (:version value)))
@@ -107,14 +107,14 @@
                          :agent "codex" :native_thread native-thread :state "Bound"}}]
                (:routes value)))
         (is (= [] (:retirements value))))
-      (let [sent (invoke environment "hm-clj-send" "00f95a" "isolated-success")]
+      (let [sent (invoke environment "hm-send" "00f95a" "isolated-success")]
         (is (zero? (:exit sent)) (:err sent))
         (is (str/includes? (:out sent) "Transported.{ 00f95a working }"))
         (is (some #(= :Submitting (:reason %)) (store/attempts-for root "00f95a"))))
       (let [short-body "one\ntwo\nλ"
             long-body (apply str (repeat 900 "λ"))
-            short-send (invoke environment "hm-clj-send" "00f95a" short-body)
-            long-send (invoke environment "hm-clj-send" "00f95a" long-body)
+            short-send (invoke environment "hm-send" "00f95a" short-body)
+            long-send (invoke environment "hm-send" "00f95a" long-body)
             lines (str/split-lines (slurp prompt-log))
             values (mapv read-string lines)
             pointer (second (last values))
@@ -132,27 +132,27 @@
                (set (keep :body (filter #(and (contains? #{:Submitting :sent} (:reason %))
                                               (not= "isolated-success" (:body %)))
                                         (store/attempts-for root "00f95a")))))))
-      (let [moved (invoke environment "hm-clj-move" "00f95a" "w2"
+      (let [moved (invoke environment "hm-move" "00f95a" "w2"
                           "--session" "s" "--pane-id" "p" "--terminal-id" "t"
                           "--name" "Mind Sol 00f95a" "--agent" "codex"
                           "--native-thread" native-thread "--process-pid" "123")]
         (is (zero? (:exit moved)) (:err moved))
         (is (= "m" (:pane_id (store/route-for root "00f95a")))))
-      (let [deregistered (invoke environment "hm-clj-deregister" "00f95a"
+      (let [deregistered (invoke environment "hm-deregister" "00f95a"
                                  "--session" "s" "--pane-id" "m" "--terminal-id" "t"
                                  "--name" "Mind Sol 00f95a")]
         (is (zero? (:exit deregistered)) (:err deregistered)))
       (let [held (invoke (assoc environment "FAKE_HERDR_AGENT_LIST" "empty")
-                         "hm-clj-send" "00f95a" "isolated-held" "--hold-seconds" "0")]
+                         "hm-send" "00f95a" "isolated-held" "--hold-seconds" "0")]
         (is (= 1 (:exit held)))
         (is (str/includes? (:err held) "Held.{ 00f95a NotRegistered"))
         (is (= "isolated-held" (:message (first (store/pending-for root "00f95a"))))))
 
-      (let [registered (invoke environment "hm-clj-register" "00f95a" "Mind Sol 00f95a"
+      (let [registered (invoke environment "hm-register" "00f95a" "Mind Sol 00f95a"
                                "--session" "s" "--native-thread" native-thread)]
         (is (zero? (:exit registered)) (:err registered)))
       (let [digest (hm/sha256 evidence)
-            retired (invoke environment "hm-clj-retire" "00f95a"
+            retired (invoke environment "hm-retire" "00f95a"
                             "--session" "s" "--pane-id" "m" "--terminal-id" "t"
                             "--name" "Mind Sol 00f95a" "--agent" "codex"
                             "--native-thread" native-thread
@@ -160,7 +160,7 @@
         (is (zero? (:exit retired)) (:err retired))
         (is (= "sender" (:retired_by (store/retirement-for root "00f95a"))))
         (is (nil? (store/route-for root "00f95a")))
-        (let [snapshot (invoke environment "hm-clj-heartbeat-state")
+        (let [snapshot (invoke environment "hm-heartbeat-state")
               value (json/parse-string (:out snapshot) true)]
           (is (zero? (:exit snapshot)) (:err snapshot))
           (is (= [] (:routes value)))

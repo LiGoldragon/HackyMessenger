@@ -1,4 +1,4 @@
-(ns hacky-messenger.typed-store
+(ns messenger-clj.typed-store
   "Typed Datalevin authority for the Clojure messenger. EDN is exposed only as
   an explicit import/export representation."
   (:require [babashka.fs :as fs]
@@ -7,7 +7,9 @@
             [malli.core :as m]))
 
 (def pod-version "0.8.25")
-(pods/load-pod 'huahaiy/datalevin pod-version)
+(if-let [executable (System/getenv "MESSENGER_CLJ_DATALEVIN_POD")]
+  (pods/load-pod executable)
+  (pods/load-pod 'huahaiy/datalevin pod-version))
 (require 'pod.huahaiy.datalevin)
 
 (defn- call [symbol & args]

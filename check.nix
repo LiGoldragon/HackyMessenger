@@ -1,6 +1,8 @@
-{ pkgs }:
-pkgs.runCommand "hacky-messenger-check" { nativeBuildInputs = [ pkgs.python3 ]; } ''
-  export PYTHONDONTWRITEBYTECODE=1
-  python3 -m unittest discover -s ${./.} -v
+{ pkgs, package }:
+pkgs.runCommand "messenger-clj-check" { nativeBuildInputs = [ package ]; } ''
+  messenger-clj --help > help
+  grep -F 'Usage: messenger-clj' help
+  test -x ${package}/bin/hm-send
+  test -x ${package}/bin/hm-heartbeat-state
   touch "$out"
 ''

@@ -1,10 +1,10 @@
-(ns hacky-messenger.core-test
+(ns messenger-clj.core-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [cheshire.core :as json]
             [malli.core]
-            [hacky-messenger.core :as hm]
-            [hacky-messenger.typed-store :as store]
+            [messenger-clj.core :as hm]
+            [messenger-clj.typed-store :as store]
             [babashka.fs :as fs]))
 
 (def route {:session "s" :name "Mind Sol 00f95a" :pane_id "p" :terminal_id "t"

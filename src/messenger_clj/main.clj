@@ -1,7 +1,7 @@
-(ns hacky-messenger.main
-  (:require [hacky-messenger.core :as hm]
-            [hacky-messenger.legacy-import :as legacy]))
-(defn usage [] (str "Usage: hm-clj <send|send-abrupt|register|deregister|rebind|move|retire|import-retirement|import-json|heartbeat-state|list> ...\n" hm/skill-note))
+(ns messenger-clj.main
+  (:require [messenger-clj.core :as hm]
+            [messenger-clj.legacy-import :as legacy]))
+(defn usage [] (str "Usage: messenger-clj <send|send-abrupt|register|deregister|rebind|move|retire|import-retirement|import-json|heartbeat-state|list> ...\n" hm/skill-note))
 (defn arg [xs option] (second (drop-while #(not= option %) xs)))
 (defn parse-error [message] (throw (ex-info message {:hm/parse true})))
 (def value-options #{"--session" "--native-thread" "--readiness-probe" "--rollout" "--old-name" "--pane-id" "--terminal-id" "--name" "--agent" "--process-pid" "--evidence" "--evidence-sha256" "--hold-seconds" "--pane" "--target" "--receipt"})
@@ -112,10 +112,10 @@
     (catch clojure.lang.ExceptionInfo e
       (binding [*out* *err*]
         (println (if (:hm/parse (ex-data e))
-                   (str "usage: " (usage) "hm-clj: error: " (.getMessage e))
-                   (str (when-not (:hm/held (ex-data e)) "hm: ") (.getMessage e))))
+                   (str "usage: " (usage) "messenger-clj: error: " (.getMessage e))
+                   (str (when-not (:hm/held (ex-data e)) "messenger-clj: ") (.getMessage e))))
         (System/exit (if (:hm/parse (ex-data e)) 2 1))))
     (catch Exception e
       (binding [*out* *err*]
-        (println "hm:" (.getMessage e))
+        (println "messenger-clj:" (.getMessage e))
         (System/exit 1)))))

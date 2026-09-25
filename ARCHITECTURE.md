@@ -1,58 +1,44 @@
-# Hacky Messenger — architecture
+# messenger-clj architecture
 
-HM has no daemon, socket, or multiplexer of its own. Each command is one
-process that reads a file registry, asks Herdr about live agents, and, for a
-send, types one prompt into one pane.
+`messenger-clj` has no daemon or socket. Each invocation reads the typed
+Datalevin store, checks Herdr, and performs at most one prompt submission.
 
-## Parts
+## Runtime
 
-`hm.py` holds the `Messenger` class and the command line. `bin/hm-*` are
-Bash wrappers, one per subcommand. `supervisor.py --stdin` reads Herdr pane
-events (one `events.subscribe` stream) and marks bindings: `pane_exited`,
-`pane_closed`, and a null agent status mark a binding `exited`; `pane_moved`
-marks it in transition. It never deletes a registration or retires a Flow.
+`messenger-clj.main` owns command parsing. `messenger-clj.core` owns route
+validation, Herdr interaction, delivery decisions, and Orchestrate
+reservations. `messenger-clj.typed-store` owns the Datalevin schema and typed
+queries. `messenger-clj.legacy-import` is a one way, explicit JSON migration
+boundary.
 
-## Registry
+Development uses the Bash launcher in `bin/messenger-clj`. Deployment uses the
+Nix package's compiled Babashka uberscript and pinned Datalevin pod. Both enter
+the same namespace and command parser. The `hm-*` names are links to the
+deployed `messenger-clj` executable; the executable maps each link name to its
+subcommand.
 
-One JSON file per Flow, `FLOW.json`, in `~/.local/state/hacky-messenger` or
-`HM_REGISTRY`. A record holds session, pane, terminal, agent name, harness,
-native thread, and, when registered through a probe, `readiness_proof`.
-Records are replaced atomically. Every registry write and every send runs
-under an Orchestrate reservation of the registry directory; contention fails
-visibly and is never retried. `attempts.jsonl` is an fsynced ledger of every send
-decision; `pending/` keeps the text of a message held as `NotRegistered` or
-`InTransition`. `retired/` holds retirement markers.
+## Store
 
-## Send
+Routes, attempts, pending messages, and retirements share one Datalevin
+database. The existing typed state path is deliberately stable through the
+rename. No operation reads the frozen Python JSON registry as a fallback.
 
-A send validates the text (nonempty, at most 64 KiB, no terminal control
-characters except newline and tab) and requires `FLOW_ID`. It waits up to
-`--hold-seconds` for a missing or transitional binding, then, under the
-reservation, checks retirement, the binding, the live Herdr agent, its
-terminal, readiness, status, and the foreground process's native thread.
-Any failed check records a `Held` attempt and types nothing. It then sends a
-`Machine.Relay` envelope through `herdr agent prompt`, re-reads the target, and
-prints `Transported` or, with `--wait-presented`, `Presented`. A failure after
-the prompt is `Uncertain` and is never retried. It never falls back to another
-route or Flow.
+Every registry write and send takes an Orchestrate reservation over the state
+root. A send persists its attempt before prompting. Once prompt submission may
+have occurred, uncertainty is recorded and the messenger never retries.
 
-Abrupt send first sends Escape through `herdr agent send-keys` (one for Codex;
-two for Claude, whose vim editor mode eats the first, followed by Enter after
-the prompt). Escape does not clear text already in the input box.
+## Delivery
 
-## Route changes
+A send validates the body and sender, resolves the stored route against live
+Herdr state, checks terminal and harness identity, and persists a submitting
+attempt. It then submits one `#msg` EDN envelope. Presentation is reported only
+when the selected Herdr operation supplies that observation.
 
-Registration refuses a Flow bound to a different terminal, a retired native
-thread, and a route hold. `rebind` changes only the agent name of an unchanged
-route. `move` persists a route hold before Herdr moves the pane, follows the
-new pane ID, and on failure moves the terminal back; an unverified
-compensation leaves the hold for manual repair. `deregister` is route repair,
-not retirement. `retire` writes an evidence-bound marker (exact route, native
-thread, SHA-256 of a lifecycle receipt) that blocks every later send and
-registration of that native thread; `import-retirement` records one after a
-separately witnessed deregistration.
+Registration, rebind, move, deregistration, and retirement require exact route
+identity. Retirement remains evidence bound and blocks later registration or
+delivery to that native thread.
 
 ## Limits
 
-Identity checking and prompting are separate Herdr calls, so a terminal
-replacement can race a send. A printed grade is not a read receipt.
+Identity checking and prompting are separate Herdr calls, so a terminal can be
+replaced between them. A transport or presentation grade is not a read receipt.

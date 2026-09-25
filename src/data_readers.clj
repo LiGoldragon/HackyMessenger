@@ -1,1 +1,1 @@
-{msg hacky-messenger.core/read-msg}
+{msg messenger-clj.core/read-msg}

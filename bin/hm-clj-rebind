@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-exec bb --config "$here/../bb.edn" -m hacky-messenger.main rebind "$@"
+exec bb --config "$here/../bb.edn" -m messenger-clj.main rebind "$@"

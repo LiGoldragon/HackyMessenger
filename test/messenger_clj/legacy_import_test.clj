@@ -1,11 +1,11 @@
-(ns hacky-messenger.legacy-import-test
+(ns messenger-clj.legacy-import-test
   (:require [babashka.fs :as fs]
             [cheshire.core :as json]
             [clojure.edn :as edn]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
-            [hacky-messenger.legacy-import :as legacy]
-            [hacky-messenger.typed-store :as store]))
+            [messenger-clj.legacy-import :as legacy]
+            [messenger-clj.typed-store :as store]))
 
 (def thread "00000000-0000-0000-0000-000000000000")
 (def route {:session "s" :name "Alpha" :pane_id "p" :terminal_id "t" :agent "codex"
