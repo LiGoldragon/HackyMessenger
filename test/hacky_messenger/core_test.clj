@@ -1,6 +1,7 @@
 (ns hacky-messenger.core-test
   (:require [clojure.edn :as edn]
             [clojure.test :refer [deftest is]]
+            [malli.core]
             [hacky-messenger.core :as hm]
             [hacky-messenger.store :as store]
             [babashka.fs :as fs]))
@@ -9,6 +10,7 @@
             :agent "codex" :native_thread "00000000-0000-0000-0000-000000000000"})
 
 (deftest identifiers-and-title-fallback-are-strict
+  (is (false? (malli.core/validate hm/FlowId "../../etc/x")))
   (is (thrown? Exception (hm/path "../../etc/x")))
   (is (thrown? Exception (hm/path "a b!")))
   (with-redefs [hm/live-agents (constantly [(assoc route :name "Mind Sol 00f95a")])]

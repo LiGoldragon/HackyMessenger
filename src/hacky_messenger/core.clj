@@ -49,7 +49,7 @@
 (def ^:dynamic *flow-id* nil)
 (defn root [] (fs/absolutize (or *root* (System/getenv "HM_REGISTRY") (str (fs/path (System/getProperty "user.home") ".local/state/hacky-messenger")))))
 (defn path [flow] (fs/path (root) (str (flow-id! flow) ".edn")))
-(defn now [] (.toString (java.time.Instant/now)))
+(defn now [] (current-time (->SystemClock)))
 (defn quote-datom [s] (str "«" (str/replace (str s) #"[\\»]" {\\ "\\\\" \» "\\»"}) "»"))
 (defn relay [sender recipient body]
   ;; Canonical seven positions: ingress, sender, heard, seat, recipients, body, context.
@@ -70,7 +70,7 @@
 (defn read-route [flow]
   (let [p (path flow)]
     (when-not (fs/exists? p) (fail (str "No valid registration for " flow)))
-    (try (route-binding! (edn/read-string (slurp (str p))))
+    (try (route-binding! (load-route (->EdnRegistry (root)) flow))
          (catch Exception e (fail (str "No valid registration for " flow ": " (.getMessage e)))))))
 (defn herdr! [& args]
   (let [{:keys [exit out err]} (apply shell {:out :string :err :string :timeout 15000} "herdr" args)]
@@ -148,7 +148,7 @@
         found (filter #(= name (:name %)) agents)]
     (when-not (= 1 (count found)) (fail (str "Expected one live agent named " name "; found " (count found) ". Use --session.")))
     (let [a (first found) route (valid! RouteBinding (assoc (select-keys a [:session :name :pane_id :terminal_id :agent]) :session session :native_thread native-thread) "RouteBinding")]
-      (atomic-edn! (path flow) route)
+      (save-route! (->EdnRegistry (root)) flow route)
       (store/index-route! (root) flow route)
       (str "Registered " flow ": " name " (" session ")"))))
 (defn send! [flow body wait-presented pane]
