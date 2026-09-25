@@ -8,6 +8,14 @@
 (def route {:session "s" :name "Mind Sol 00f95a" :pane_id "p" :terminal_id "t"
             :agent "codex" :native_thread "00000000-0000-0000-0000-000000000000"})
 
+(deftest identifiers-and-title-fallback-are-strict
+  (is (thrown? Exception (hm/path "../../etc/x")))
+  (is (thrown? Exception (hm/path "a b!")))
+  (with-redefs [hm/live-agents (constantly [(assoc route :name "Mind Sol 00f95a")])]
+    (is (= "p" (:pane_id (first (hm/resolve-send-route "00f95a" nil nil))))))
+  (with-redefs [hm/live-agents (constantly [(assoc route :name "A 00f95a") (assoc route :name "B 00f95a")])]
+    (is (thrown? Exception (hm/resolve-send-route "00f95a" nil nil)))))
+
 (deftest relay-is-a-bounded-edn-round-trip
   (let [line (hm/relay "00f95a" "e51411" "receipt")
         value (edn/read-string line)]

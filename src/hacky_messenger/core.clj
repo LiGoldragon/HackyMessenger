@@ -8,7 +8,7 @@
             [malli.core :as m]))
 
 (def skill-note "Documented by the compensation-hacky-messenger skill (Curriculum skills/compensation-hacky-messenger.md). Update that skill with any change to this tool.")
-(def failure-reasons #{:NotRegistered :InTransition :RouteHold :IdentityChanged :PaneMissing :NotReady :Blocked :ProcessMismatch :Stalled :Uncertain :Submitting})
+(def failure-reasons #{:NotRegistered :InTransition :RouteHold :IdentityChanged :PaneMissing :NotReady :Blocked :ProcessMismatch :Stalled :Uncertain :Submitting :sent})
 (def delivery-grades #{:Transported :Presented :Fallback-Presented :Held :Uncertain})
 (def FlowId [:string {:min 1 :max 96 :re #"^[A-Za-z0-9][A-Za-z0-9_-]*$"}])
 (def NativeThread [:string {:min 16 :max 96 :re #"^[A-Za-z0-9-]+$"}])
@@ -24,10 +24,31 @@
 
 (defn fail [s] (throw (ex-info s {:hm/failure true})))
 (defn valid! [schema value label] (if (m/validate schema value) value (fail (str "Invalid " label ": " (pr-str (m/explain schema value))))))
+(declare atomic-edn!)
+(defn flow-id! [value]
+  (when-not (and (string? value) (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" value)) (fail "Invalid FlowId"))
+  (valid! FlowId value "FlowId"))
+(defn native-thread! [value]
+  (when-not (and (string? value) (re-matches #"[A-Za-z0-9-]{16,96}" value)) (fail "Invalid NativeThread"))
+  (valid! NativeThread value "NativeThread"))
+(defn route-binding! [value] (valid! RouteBinding value "RouteBinding"))
+(defn delivery-attempt! [value]
+  (when-not (and (contains? failure-reasons (:reason value)) (contains? delivery-grades (:grade value)))
+    (fail "Invalid DeliveryAttempt grade or reason"))
+  (valid! DeliveryAttempt value "DeliveryAttempt"))
+(defprotocol Registry (load-route [this flow]) (save-route! [this flow route]))
+(defprotocol HerdrTransport (live-agents* [this]) (target-agent* [this route]) (prompt!* [this route envelope wait?]))
+(defprotocol Ledger (record-attempt! [this attempt]) (record-pending! [this attempt body]))
+(defprotocol Clock (current-time [this]))
+(defrecord SystemClock [] Clock (current-time [_] (.toString (java.time.Instant/now))))
+(defrecord EdnRegistry [state-root]
+  Registry
+  (load-route [_ flow] (edn/read-string (slurp (str (fs/path state-root (str (flow-id! flow) ".edn"))))))
+  (save-route! [_ flow route] (atomic-edn! (fs/path state-root (str (flow-id! flow) ".edn")) (route-binding! route))))
 (def ^:dynamic *root* nil)
 (def ^:dynamic *flow-id* nil)
 (defn root [] (fs/absolutize (or *root* (System/getenv "HM_REGISTRY") (str (fs/path (System/getProperty "user.home") ".local/state/hacky-messenger")))))
-(defn path [flow] (valid! FlowId flow "FlowId") (fs/path (root) (str flow ".edn")))
+(defn path [flow] (fs/path (root) (str (flow-id! flow) ".edn")))
 (defn now [] (.toString (java.time.Instant/now)))
 (defn quote-datom [s] (str "«" (str/replace (str s) #"[\\»]" {\\ "\\\\" \» "\\»"}) "»"))
 (defn relay [sender recipient body]
@@ -49,7 +70,7 @@
 (defn read-route [flow]
   (let [p (path flow)]
     (when-not (fs/exists? p) (fail (str "No valid registration for " flow)))
-    (try (valid! RouteBinding (edn/read-string (slurp (str p))) "RouteBinding")
+    (try (route-binding! (edn/read-string (slurp (str p))))
          (catch Exception e (fail (str "No valid registration for " flow ": " (.getMessage e)))))))
 (defn herdr! [& args]
   (let [{:keys [exit out err]} (apply shell {:out :string :err :string :timeout 15000} "herdr" args)]
@@ -85,14 +106,14 @@
     pane (let [{:keys [session pane_id]} (parse-pane pane)
                hits (filter #(and (= session (:session %)) (= pane_id (:pane_id %))) (live-agents))]
            (when-not (= 1 (count hits)) (fail "Held: --pane does not name exactly one live Herdr agent"))
-           (valid! RouteBinding (assoc (select-keys (first hits) [:name :pane_id :terminal_id :agent]) :session session :native_thread (or (:native_thread stored) "00000000-0000-0000-0000-000000000000")) "RouteBinding"))
+           (route-binding! (assoc (select-keys (first hits) [:name :pane_id :terminal_id :agent]) :session session :native_thread (or (:native_thread stored) "00000000-0000-0000-0000-000000000000"))))
     stored (let [hits (filter #(and (= (:session stored) (:session %)) (= (:name stored) (:name %))) (live-agents))]
              (when-not (= 1 (count hits)) (fail "Held: stored route has no unique live Herdr agent"))
              (assoc (first hits) :native_thread (:native_thread stored)))
     :else (let [suffix (re-pattern (str "\\b" (java.util.regex.Pattern/quote flow) "$"))
                 hits (filter #(re-find suffix (or (:name %) "")) (live-agents))]
             (when-not (= 1 (count hits)) (fail "Held: Flow title has no unique live Herdr agent"))
-            (let [a (first hits)] (valid! RouteBinding (assoc (select-keys a [:session :name :pane_id :terminal_id :agent]) :native_thread "00000000-0000-0000-0000-000000000000") "RouteBinding")))))
+            (let [a (first hits)] (route-binding! (assoc (select-keys a [:session :name :pane_id :terminal_id :agent]) :native_thread "00000000-0000-0000-0000-000000000000"))))))
 (defn exact-live-route? [stored]
   (some #(and (= (:session stored) (:session %))
               (= (:name stored) (:name %))
@@ -109,7 +130,7 @@
 (defn append-attempt! [flow reason grade route]
   (let [attempt (cond-> {:id (str (java.util.UUID/randomUUID)) :at (now) :flow flow :reason reason :grade grade}
                   route (assoc :binding route))]
-    (valid! DeliveryAttempt attempt "DeliveryAttempt")
+    (delivery-attempt! attempt)
     (fs/create-dirs (root))
     (spit (str (fs/path (root) "attempts.edn")) (str (pr-str attempt) "\n") :append true)
     (store/index-attempt! (root) attempt)
