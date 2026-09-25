@@ -163,8 +163,8 @@
     (is (re-find #"ProcessMismatch" (send-result good-agent [{:argv ["codex" "--thread" "different"]}])))
     (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation]
       (hm/atomic-edn! (hm/retired-path "00f95a") {:flow "00f95a" :record route :native_thread (:native_thread route)})
-      (is (re-find #"Retired" (try (hm/send! "00f95a" "body" false nil)
-                                   (catch Exception error (.getMessage error)))))
+      (is (re-find #"Retirement marker" (try (hm/send! "00f95a" "body" false nil)
+                                             (catch Exception error (.getMessage error)))))
       (fs/delete (hm/retired-path "00f95a")))
     (binding [hm/*root* root-path hm/*flow-id* "sender"
               hm/*with-reservation* (fn [_ _] (hm/fail "Reservation refused"))
@@ -292,3 +292,23 @@
         (hm/atomic-edn! (hm/path "00f95a") (assoc route :route_hold "pane_move_in_progress"))
         (is (thrown? Exception (hm/move! "00f95a" "s" "p" "t" "Mind Sol 00f95a" "codex" (:native_thread route) 123 "w2")))
         (is (= "p" @moves))))))
+
+(deftest retirement-is-evidence-bound-idempotent-and-blocks-reuse
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-retire-"}))
+        evidence (fs/create-temp-file {:prefix "hm-evidence-"})]
+    (spit (str evidence) "witness")
+    (binding [hm/*root* root-path hm/*with-reservation* pass-reservation]
+      (hm/atomic-edn! (hm/path "00f95a") route)
+      (let [digest (hm/sha256 evidence)]
+        (is (= "Retired 00f95a: delivery is blocked before Herdr routing"
+               (hm/retire! "00f95a" "s" "p" "t" "Mind Sol 00f95a" "codex" (:native_thread route) evidence digest false)))
+        (is (= "Already retired 00f95a: marker retained"
+               (hm/retire! "00f95a" "s" "p" "t" "Mind Sol 00f95a" "codex" (:native_thread route) evidence digest false)))
+        (is (thrown? Exception (hm/assert-not-retired! "00f95a")))
+        (is (thrown? Exception (hm/assert-native-not-retired! (:native_thread route) "other-flow")))
+        (is (thrown? Exception (hm/retire! "00f95a" "s" "other" "t" "Mind Sol 00f95a" "codex" (:native_thread route) evidence digest false)))
+        (fs/create-dirs (fs/parent (hm/retired-path "broken")))
+        (spit (str (hm/retired-path "broken")) "{:bad true}")
+        (is (thrown? Exception (hm/assert-not-retired! "broken")))
+        (is (= "Retired imported: delivery is blocked before Herdr routing"
+               (hm/retire! "imported" "s" "p" "t" "Mind Sol 00f95a" "codex" (:native_thread route) evidence digest true)))))))

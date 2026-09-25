@@ -17,7 +17,9 @@
 (def RouteBinding [:map [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string] [:native_thread NativeThread] [:readiness_proof {:optional true} ReadinessProof]])
 (def DeliveryAttempt [:map [:id :string] [:at :string] [:flow FlowId] [:reason :keyword] [:grade {:optional true} :keyword] [:binding {:optional true} RouteBinding]])
 (def PendingIntent [:map [:attempt DeliveryAttempt] [:message MessageBody] [:state [:= "held"]]])
-(def RetirementMarker [:map [:flow FlowId] [:record RouteBinding] [:native_thread NativeThread]])
+(def RouteIdentity [:map [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string]])
+(def RetirementEvidence [:map [:path :string] [:sha256 [:re #"^[0-9a-f]{64}$"]]])
+(def RetirementMarker [:map [:version [:= 1]] [:state [:= "retired"]] [:flow FlowId] [:record RouteIdentity] [:native_thread NativeThread] [:evidence RetirementEvidence]])
 (def Reservation [:map [:id :int] [:flow FlowId] [:root :string]])
 (def MachineRelay [:tuple :string FlowId :string :string [:vector FlowId] MessageBody :string])
 (doseq [schema [FlowId NativeThread MessageBody ReadinessProof RouteBinding DeliveryAttempt PendingIntent RetirementMarker Reservation MachineRelay]] (m/validator schema))
@@ -116,13 +118,27 @@
   (move-pane* [_ route workspace label] (herdr! "--session" (:session route) "pane" "move" (:pane_id route) "--new-tab" "--workspace" workspace "--label" label "--no-focus"))
   (prompt!* [_ route envelope wait?] (direct-prompt! route envelope wait?)))
 (defn transport [] (or *transport* (->ShellHerdr)))
-(defn assert-not-retired! [flow]
+(defn sha256 [file]
+  (apply str (map #(format "%02x" (bit-and % 0xff)) (.digest (doto (java.security.MessageDigest/getInstance "SHA-256") (.update (fs/read-all-bytes file)))))))
+(defn retirement! [flow]
   (let [marker (retired-path flow)]
     (when (fs/exists? marker)
       (try
-        (valid! RetirementMarker (edn/read-string (slurp (str marker))) "RetirementMarker")
-        (catch Exception _ (fail (str "Retirement marker for " flow " is unavailable or malformed"))))
-      (fail (str "Retired: " flow)))))
+        (let [value (valid! RetirementMarker (edn/read-string (slurp (str marker))) "RetirementMarker")
+              evidence (:evidence value)]
+          (when-not (and (= flow (:flow value)) (fs/absolute? (:path evidence)) (fs/regular-file? (:path evidence))
+                         (= (:sha256 evidence) (sha256 (:path evidence))))
+            (fail "bad marker"))
+          value)
+        (catch Exception _ (fail (str "Retirement marker for " flow " is unavailable or malformed")))))))
+(defn assert-not-retired! [flow]
+  (when-let [marker (retirement! flow)]
+    (fail (str "Retired: " flow " by " (get-in marker [:evidence :path])))))
+(defn assert-native-not-retired! [native-thread flow]
+  (doseq [marker (fs/glob (fs/path (root) "retired") "*.edn")]
+    (let [other (fs/strip-ext (fs/file-name marker))]
+      (when (and (not= flow other) (= native-thread (:native_thread (retirement! other))))
+        (fail (str "Native thread " native-thread " is retired as Flow " other "; use a fresh native session"))))))
 (defn process-matches! [route]
   (let [reply (process-info* (transport) route)
         info (or (:process_info reply) reply)
@@ -289,6 +305,8 @@
                     {:hm/failure true :hm/held true}))))
 (defn register! [flow name session native-thread readiness-marker rollout]
   (flow-id! flow) (native-thread! native-thread)
+  (assert-not-retired! flow)
+  (assert-native-not-retired! native-thread flow)
   (let [agents (:agents (herdr! "--session" session "agent" "list"))
         found (filter #(= name (:name %)) agents)]
     (when-not (= 1 (count found)) (fail (str "Expected one live agent named " name "; found " (count found) ". Use --session.")))
@@ -317,6 +335,35 @@
         (fs/delete (path flow))
         (store/remove-route! (root) flow)
         (str "Deregistered stale " flow ": " name " (" session "/" pane-id "/" terminal-id ")")))))
+(defn retirement-evidence! [evidence-path evidence-sha256]
+  (let [path (fs/absolutize evidence-path)]
+    (when-not (and (fs/absolute? path) (fs/regular-file? path) (string? evidence-sha256) (re-matches #"[0-9a-f]{64}" evidence-sha256))
+      (fail "Retirement evidence requires an existing absolute file and SHA-256 digest"))
+    (let [actual (sha256 path)]
+      (when-not (= evidence-sha256 actual) (fail "Retirement evidence SHA-256 does not match; nothing changed"))
+      {:path (str path) :sha256 actual})))
+(defn retire! [flow session pane-id terminal-id name agent native-thread evidence-path evidence-sha256 allow-absent?]
+  (flow-id! flow)
+  (nonempty-strings! "Retirement requires every exact route identity field" [session pane-id terminal-id name agent])
+  (native-thread! native-thread)
+  (let [evidence (retirement-evidence! evidence-path evidence-sha256)
+        expected {:session session :pane_id pane-id :terminal_id terminal-id :name name :agent agent}]
+    (with-reservation flow
+      (fn []
+        (if-let [existing (retirement! flow)]
+          (if (and (= expected (:record existing)) (= native-thread (:native_thread existing)))
+            (str "Already retired " flow ": marker retained")
+            (fail (str "Flow " flow " already has a different retirement marker")))
+          (do
+            (if (fs/exists? (path flow))
+              (when-not (= expected (select-keys (read-route flow) (keys expected)))
+                (fail "Registration differs from the explicitly revalidated retirement route"))
+              (when-not allow-absent?
+                (fail "No current registration; use import-retirement only with retained exact evidence")))
+            (atomic-edn! (retired-path flow)
+                         (valid! RetirementMarker {:version 1 :state "retired" :flow flow :record expected
+                                                   :native_thread native-thread :evidence evidence} "RetirementMarker"))
+            (str "Retired " flow ": delivery is blocked before Herdr routing")))))))
 (defn rebind! [flow old-name new-name session pane-id terminal-id agent native-thread]
   (flow-id! flow)
   (nonempty-strings! "Rebind requires every exact old route identity field" [old-name session pane-id terminal-id agent])
@@ -411,14 +458,16 @@
               (catch Exception error
                 (if-not @moved
                   (fail (str "Move failed or is uncertain; inspect exact terminal before routing: " (.getMessage error)))
-                  (try
-                    (let [reverse-result (move-result-value (move-pane* (transport) (assoc record :pane_id (:pane_id @moved)) old-workspace (or (:label source) name)))
-                          reverse (:pane reverse-result)
-                          verified (verify-move-target! expected reverse process-pid native-thread)]
-                      (move-route! flow record (:pane_id verified) false)
-                      (fail (str "Move failed; terminal was returned to original workspace with new pane ID: " (.getMessage error))))
-                    (catch Exception rollback-error
-                      (fail (str "Move and compensation failed; delivery held for manual route repair: " (.getMessage rollback-error))))))))))))))
+                  (let [rollback-error (try
+                                         (let [reverse-result (move-result-value (move-pane* (transport) (assoc record :pane_id (:pane_id @moved)) old-workspace (or (:label source) name)))
+                                               reverse (:pane reverse-result)
+                                               verified (verify-move-target! expected reverse process-pid native-thread)]
+                                           (move-route! flow record (:pane_id verified) false)
+                                           nil)
+                                         (catch Exception rollback-error rollback-error))]
+                    (if rollback-error
+                      (fail (str "Move and compensation failed; delivery held for manual route repair: " (.getMessage rollback-error)))
+                      (fail (str "Move failed; terminal was returned to original workspace with new pane ID: " (.getMessage error))))))))))))))
 (defn send! [flow body wait-presented pane]
   (flow-id! flow) (valid! MessageBody body "MessageBody")
   (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))

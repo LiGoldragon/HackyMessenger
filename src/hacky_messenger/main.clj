@@ -1,6 +1,6 @@
 (ns hacky-messenger.main
   (:require [hacky-messenger.core :as hm]))
-(defn usage [] (str "Usage: hm-clj <send|register|deregister|rebind|move|list> ...\n" hm/skill-note))
+(defn usage [] (str "Usage: hm-clj <send|register|deregister|rebind|move|retire|import-retirement|list> ...\n" hm/skill-note))
 (defn arg [xs option] (second (drop-while #(not= option %) xs)))
 (defn parse-error [message] (throw (ex-info message {:hm/parse true})))
 (defn unknown-flags! [xs allowed]
@@ -49,6 +49,14 @@
                        (parse-error "the following arguments are required: --session, --pane-id, --terminal-id, --name, --agent, --native-thread, --process-pid"))
                      (let [pid (try (parse-long pid-text) (catch Exception _ (parse-error "argument --process-pid: invalid int value")))]
                        (println (hm/move! flow session pane-id terminal-id name agent native-thread pid workspace)))))
+          ("retire" "import-retirement") (let [[flow & rest] xs]
+                                           (when-not flow (parse-error "the following arguments are required: flow"))
+                                           (unknown-flags! rest #{"--session" "--pane-id" "--terminal-id" "--name" "--agent" "--native-thread" "--evidence" "--evidence-sha256"})
+                                           (let [session (arg rest "--session") pane-id (arg rest "--pane-id") terminal-id (arg rest "--terminal-id") name (arg rest "--name")
+                                                 agent (arg rest "--agent") native-thread (arg rest "--native-thread") evidence (arg rest "--evidence") digest (arg rest "--evidence-sha256")]
+                                             (when-not (every? some? [session pane-id terminal-id name agent native-thread evidence digest])
+                                               (parse-error "the following arguments are required: --session, --pane-id, --terminal-id, --name, --agent, --native-thread, --evidence, --evidence-sha256"))
+                                             (println (hm/retire! flow session pane-id terminal-id name agent native-thread evidence digest (= op "import-retirement")))))
           "list" (println (hm/listing!))
           (parse-error (str "invalid choice: " op)))))
     (catch clojure.lang.ExceptionInfo e
