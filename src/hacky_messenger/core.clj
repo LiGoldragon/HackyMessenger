@@ -25,8 +25,8 @@
 (def RetirementEvidence [:map {:closed true} [:path :string] [:sha256 [:re #"^[0-9a-f]{64}$"]]])
 (def RetirementMarker [:map {:closed true} [:version [:= 1]] [:state [:= "retired"]] [:flow FlowId] [:record RouteIdentity] [:native_thread NativeThread] [:evidence RetirementEvidence] [:retired_by :string] [:retired_at :string]])
 (def Reservation [:map {:closed true} [:id :int] [:flow FlowId] [:root :string]])
-(def MachineRelay [:tuple :string FlowId :string :string [:vector FlowId] MessageBody :string])
-(doseq [schema [FlowId NativeThread MessageBody ReadinessProof RouteBinding DeliveryAttempt PendingIntent RetirementMarker Reservation MachineRelay]] (m/validator schema))
+(def PaneMessage [:tuple FlowId MessageBody])
+(doseq [schema [FlowId NativeThread MessageBody ReadinessProof RouteBinding DeliveryAttempt PendingIntent RetirementMarker Reservation PaneMessage]] (m/validator schema))
 
 (defn fail [s] (throw (ex-info s {:hm/failure true})))
 (defn valid! [schema value label] (if (m/validate schema value) value (fail (str "Invalid " label ": " (pr-str (m/explain schema value))))))
@@ -76,19 +76,22 @@
 (defn registry [] (or *registry* (->DatalevinRegistry (root))))
 (defn now [] (current-time (or *clock* (->SystemClock))))
 (defn quote-datom [s] (str "«" (str/replace (str s) #"[\\»]" {\\ "\\\\" \» "\\»"}) "»"))
-(defn relay-line [sender recipient body]
-  ;; Canonical seven positions: ingress, sender, heard, seat, recipients, body, context.
-  (let [heard (now)
-        seat (or (System/getenv "MESSAGING_SEAT") "unknown")
-        positions (valid! MachineRelay ["machine" sender heard seat [recipient] body ""] "Machine.Relay")
-        line (binding [*print-namespace-maps* false] (pr-str {:machine/relay positions}))]
-    (when-not (= {:machine/relay positions} (edn/read-string line))
-      (fail "Machine.Relay EDN round trip failed; message held"))
+(defn read-msg [value]
+  ;; `data_readers.clj` binds #msg to this function for Clojure readers.  The
+  ;; tagged value is deliberately just the two pane-visible fields.
+  (valid! PaneMessage value "#msg"))
+(defn read-pane-message [line]
+  (edn/read-string {:readers {'msg read-msg}} line))
+(defn relay-line [sender _recipient body]
+  (let [message (read-msg [sender body])
+        line (str "#msg " (pr-str message))]
+    (when-not (= message (read-pane-message line))
+      (fail "#msg EDN round trip failed; message held"))
     line))
 (defn relay [sender recipient body]
   (let [line (relay-line sender recipient body)]
     (when (or (str/includes? line "\n") (> (count line) 800))
-      (fail "Machine.Relay EDN must be one line of at most 800 characters; message held"))
+      (fail "#msg EDN must be one line of at most 800 characters; message held"))
     line))
 (defn primary-root []
   (fs/absolutize (or (System/getenv "HM_PRIMARY_ROOT")
@@ -143,9 +146,10 @@
             pointer (str "Message too long for a pane; read " path " in full.")]
         (relay sender recipient pointer)))))
 (defn nested-relay? [body]
-  (or (str/includes? body "Machine.Relay.{")
+  (or (str/includes? body "#msg")
+      (str/includes? body "Machine.Relay.{")
       (try
-        (let [value (edn/read-string body)]
+        (let [value (read-pane-message body)]
           (boolean (some #(and (map? %) (contains? % :machine/relay))
                          (tree-seq coll? seq value))))
         (catch Exception _ false))))
@@ -577,7 +581,7 @@
 (defn send-abrupt! [flow body wait-presented]
   (flow-id! flow) (valid! MessageBody body "MessageBody")
   (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))
-  (when (nested-relay? body) (fail "Nested Machine.Relay is not a message body"))
+  (when (nested-relay? body) (fail "Nested #msg is not a message body"))
   (let [sender (or *flow-id* (System/getenv "FLOW_ID") (fail "Set FLOW_ID to your own flow ID before sending"))]
     (with-reservation flow
       (fn []
@@ -626,7 +630,7 @@
   ([flow body wait-presented pane hold-seconds]
    (flow-id! flow) (valid! MessageBody body "MessageBody")
    (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))
-   (when (nested-relay? body) (fail "Nested Machine.Relay is not a message body"))
+   (when (nested-relay? body) (fail "Nested #msg is not a message body"))
    (let [sender (or *flow-id* (System/getenv "FLOW_ID") (fail "Set FLOW_ID to your own flow ID before sending"))]
      (with-reservation flow
        (fn []

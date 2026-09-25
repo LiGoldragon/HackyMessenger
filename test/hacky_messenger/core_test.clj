@@ -1,6 +1,5 @@
 (ns hacky-messenger.core-test
-  (:require [clojure.edn :as edn]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [cheshire.core :as json]
             [malli.core]
@@ -60,14 +59,12 @@
 
 (deftest relay-is-a-bounded-edn-round-trip
   (let [line (hm/relay "00f95a" "e51411" "receipt")
-        value (edn/read-string line)]
+        value (hm/read-pane-message line)]
     (is (<= (count line) 800))
     (is (not (.contains line "\n")))
-    (is (.startsWith line "{:machine/relay"))
-    (is (not (.startsWith line "#:machine")))
-    (is (= "machine" (first (:machine/relay value))))
-    (is (= "00f95a" (second (:machine/relay value))))
-    (is (= ["e51411"] (nth (:machine/relay value) 4)))))
+    (is (= "#msg [\"00f95a\" \"receipt\"]" line))
+    (is (= ["00f95a" "receipt"] value))
+    (is (= value (read-string line)))))
 
 (deftest framed-text-is-one-line-edn-and-durably-points-to-overflow
   (let [primary (str (fs/create-temp-dir {:prefix "hm-primary-"}))
@@ -75,20 +72,20 @@
     (binding [hm/*clock* fixed-clock]
       (with-redefs [hm/primary-root (constantly primary)]
         (let [short-line (hm/framed-text "sender" "00f95a" "one\ntwo\nλ")
-              short-value (edn/read-string short-line)]
+              short-value (hm/read-pane-message short-line)]
           (is (<= (count short-line) 800))
           (is (not (str/includes? short-line "\n")))
-          (is (= "one two λ" (nth (:machine/relay short-value) 5))))
+          (is (= ["sender" "one two λ"] short-value)))
         (let [overhead (dec (count (hm/relay-line "sender" "00f95a" "x")))
               exact-body (apply str (repeat (- 800 overhead) "x"))
               exact-line (hm/framed-text "sender" "00f95a" exact-body)]
           (is (= 800 (count exact-line)))
-          (is (= exact-body (nth (:machine/relay (edn/read-string exact-line)) 5))))
+          (is (= ["sender" exact-body] (hm/read-pane-message exact-line))))
         (doseq [body [(apply str (repeat 900 "λ"))
                       "one\ntwo\nthree\nfour"
                       "literal <pasted_content> wrapper"]]
           (let [line (hm/framed-text "sender" "00f95a" body)
-                pointer (nth (:machine/relay (edn/read-string line)) 5)
+                pointer (second (hm/read-pane-message line))
                 path (second (re-find #"read (.+) in full\." pointer))]
             (is (<= (count line) 800))
             (is (not (str/includes? line "\n")))
@@ -98,14 +95,14 @@
             (is (= (if (str/ends-with? body "\n") body (str body "\n"))
                    (slurp path)))))))))
 
-(deftest nested-machine-relay-is-rejected-before-send
-  (is (re-find #"Nested Machine\.Relay"
-               (try (hm/send! "00f95a" (pr-str {:machine/relay ["machine" "sender" "heard" "seat" ["00f95a"] "body" ""]}) false nil)
+(deftest nested-pane-message-is-rejected-before-send
+  (is (re-find #"Nested #msg"
+               (try (hm/send! "00f95a" "#msg [\"sender\" \"body\"]" false nil)
                     (catch Exception error (.getMessage error))))))
 
 (deftest closed-core-records-and-deep-relays-are-rejected
   (is (false? (malli.core/validate hm/RouteBinding (assoc route :unexpected true))))
-  (is (hm/nested-relay? (pr-str [{:machine/relay ["machine" "sender" "heard" "seat" ["00f95a"] "body" ""]}])))
+  (is (hm/nested-relay? "#msg [\"sender\" \"body\"]"))
   (is (hm/nested-relay? "Machine.Relay.{ relayed }")))
 
 (deftest abrupt-send-is-durable-gated-and-agent-specific
