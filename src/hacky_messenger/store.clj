@@ -9,6 +9,10 @@
 
 (defn- call [symbol & args]
   (apply (or (resolve symbol) (throw (ex-info (str "Datalevin pod lacks " symbol) {}))) args))
+(defn- rows! [value width]
+  (when-not (and (set? value) (every? #(and (vector? %) (= width (count %))) value))
+    (throw (ex-info "Datalevin returned an invalid query shape" {:value value :width width})))
+  value)
 
 (def schema
   {:hm/identity {:db/unique :db.unique/identity}
@@ -47,30 +51,30 @@
 
 (defn attempts-for [root flow]
   (with-connection root
-    #(call 'pod.huahaiy.datalevin/q
-           '[:find ?identity ?reason
-             :in $ ?flow
-             :where [?e :hm/kind :attempt]
-             [?e :hm/flow ?flow]
-             [?e :hm/identity ?identity]
-             [?e :hm/reason ?reason]]
-           (call 'pod.huahaiy.datalevin/db %) flow)))
+    #(rows! (call 'pod.huahaiy.datalevin/q
+                  '[:find ?identity ?reason
+                    :in $ ?flow
+                    :where [?e :hm/kind :attempt]
+                    [?e :hm/flow ?flow]
+                    [?e :hm/identity ?identity]
+                    [?e :hm/reason ?reason]]
+                  (call 'pod.huahaiy.datalevin/db %) flow) 2)))
 
 (defn pending-for [root flow]
   (with-connection root
-    #(call 'pod.huahaiy.datalevin/q
-           '[:find ?identity ?reason
-             :in $ ?flow
-             :where [?e :hm/kind :pending]
-             [?e :hm/flow ?flow]
-             [?e :hm/identity ?identity]
-             [?e :hm/reason ?reason]]
-           (call 'pod.huahaiy.datalevin/db %) flow)))
+    #(rows! (call 'pod.huahaiy.datalevin/q
+                  '[:find ?identity ?reason
+                    :in $ ?flow
+                    :where [?e :hm/kind :pending]
+                    [?e :hm/flow ?flow]
+                    [?e :hm/identity ?identity]
+                    [?e :hm/reason ?reason]]
+                  (call 'pod.huahaiy.datalevin/db %) flow) 2)))
 
 (defn routes-for [root]
   (with-connection root
-    #(call 'pod.huahaiy.datalevin/q
-           '[:find ?flow
-             :where [?e :hm/kind :route]
-             [?e :hm/flow ?flow]]
-           (call 'pod.huahaiy.datalevin/db %))))
+    #(rows! (call 'pod.huahaiy.datalevin/q
+                  '[:find ?flow
+                    :where [?e :hm/kind :route]
+                    [?e :hm/flow ?flow]]
+                  (call 'pod.huahaiy.datalevin/db %)) 1)))

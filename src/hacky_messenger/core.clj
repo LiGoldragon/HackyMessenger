@@ -105,7 +105,12 @@
 (defn herdr! [& args]
   (let [{:keys [exit out err]} (apply shell {:out :string :err :string :continue true :timeout 15000} "herdr" args)]
     (when-not (zero? exit) (fail (or (not-empty (str/trim err)) (str "herdr failed: " exit))))
-    (try (let [reply (json/parse-string out true)] (if (:error reply) (fail (str "Herdr: " (:error reply))) (or (:result reply) reply)))
+    (try (let [reply (json/parse-string out true)]
+           (when-not (map? reply) (fail "Herdr returned malformed JSON object; do not blindly retry a send"))
+           (when (:error reply) (fail (str "Herdr: " (:error reply))))
+           (let [result (or (:result reply) reply)]
+             (when-not (map? result) (fail "Herdr returned malformed result object; do not blindly retry a send"))
+             result))
          (catch Exception _ (fail "Herdr returned invalid JSON; do not blindly retry a send")))))
 (declare shell-live-agents)
 (defn direct-prompt! [route envelope wait-presented]
