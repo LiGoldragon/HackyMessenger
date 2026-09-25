@@ -56,13 +56,27 @@ nix run . -- --help
 nix flake check
 ```
 
+The managed Home activation exposes that package through
+`~/.local/libexec/messenger-clj`; the old
+`~/.local/libexec/hacky-messenger-clojure` installation is removed after the
+launcher cutover succeeds.
+
 ## State continuity
 
-The typed state root stays at
-`~/.local/state/hacky-messenger-clojure` so the repository rename does not
-split the live registry or ledger. `HM_REGISTRY` may select another root for
-tests and isolated operation. The old Python source and JSON state are retained
-only as frozen migration inputs.
+The final typed state root is `~/.local/state/messenger-clj`. `HM_REGISTRY` may
+select another root for tests and isolated operation. The old Python source and
+JSON state are retained only as frozen migration inputs.
+
+The currently installed 9176503a launcher still selects the transitional
+`~/.local/state/hacky-messenger-clojure` root. Deployment must hold
+Orchestrate locks over both roots, stop concurrent messenger invocations, move
+the database once, and replace every installed launcher in the same managed
+Home activation. Moving the database before that activation would let the old
+launcher recreate the old root and split authority.
+
+Concurrent operations use unique Orchestrate lock names against the same state
+path. A competing operation waits for that path lock for a bounded interval;
+timeout refuses before a prompt or ledger write.
 
 ## Clojure tests
 

@@ -66,15 +66,18 @@
 (def ^:dynamic *registry* nil)
 (def ^:dynamic *clock* nil)
 (def ^:dynamic *transport* nil)
+(def ^:dynamic *shell* shell)
 (def ^:dynamic *readiness-attempts* 50)
+(def ^:dynamic *reservation-wait-ms* 15000)
+(def ^:dynamic *reservation-retry-ms* 50)
 ;; A test seam around the Orchestrate boundary.  Production always uses
 ;; `with-reservation` below; tests supply a short-lived in-memory lease.
 (def ^:dynamic *with-reservation* nil)
 (defn root []
-  ;; Keep the deployed typed state path stable across the repository rename.
-  ;; It never shares Python's JSON registry.
+  ;; The deployment migrates the typed database here while holding both state
+  ;; roots and replacing every launcher in the same activation.
   (fs/absolutize (or *root* (System/getenv "HM_REGISTRY")
-                     (str (fs/path (System/getProperty "user.home") ".local/state/hacky-messenger-clojure")))))
+                     (str (fs/path (System/getProperty "user.home") ".local/state/messenger-clj")))))
 (defn registry [] (or *registry* (->DatalevinRegistry (root))))
 (defn now [] (current-time (or *clock* (->SystemClock))))
 (defn quote-datom [s] (str "«" (str/replace (str s) #"[\\»]" {\\ "\\\\" \» "\\»"}) "»"))
@@ -363,17 +366,37 @@
   ;; The pre-prompt record is already durable.  Keep the original uncertainty
   ;; if storage is unavailable while recording this post-submit observation.
   (try (append-attempt! flow :Uncertain :Uncertain route body) (catch Exception _ nil)))
+(defn contention? [reply]
+  (boolean (re-find #"LockRejected\.(?:DuplicateName|PathConflict)|(?:DuplicateName|PathConflict)"
+                    (str (:out reply) "\n" (:err reply)))))
 (defn reserve! [flow]
   (let [owner (flow-id! (or *flow-id* (System/getenv "FLOW_ID") flow))
-        reply (shell {:out :string :err :string :continue true :timeout 15000}
-                     "orchestrate"
-                     (str "Lock.{ MessengerCljDelivery " owner " [ " (quote-datom (root)) " ] «Register or submit through Herdr» }"))
-        match (re-find #"Locked\.\{\s+(\d+)\b" (:out reply))]
-    (when-not (and (zero? (:exit reply)) match)
-      (fail (str "Reservation refused: " (str/trim (or (not-empty (:out reply)) (:err reply) "")))))
-    (valid! Reservation {:id (parse-long (second match)) :flow flow :root (str (root))} "Reservation")))
+        operation (str "MessengerCljDelivery-"
+                       (str/replace (str (java.util.UUID/randomUUID)) "-" ""))
+        query (str "Lock.{ " operation " " owner " [ " (quote-datom (root))
+                   " ] «Register or submit through Herdr» }")
+        deadline (+ (System/nanoTime) (* 1000000 (long *reservation-wait-ms*)))]
+    (loop []
+      (let [reply (*shell* {:out :string :err :string :continue true :timeout 15000}
+                           "orchestrate" query)
+            match (re-find #"Locked\.\{\s+(\d+)\b" (:out reply))]
+        (cond
+          (and (zero? (:exit reply)) match)
+          (valid! Reservation {:id (parse-long (second match)) :flow flow :root (str (root))}
+                  "Reservation")
+
+          (and (contention? reply) (< (System/nanoTime) deadline))
+          (do (Thread/sleep (long *reservation-retry-ms*)) (recur))
+
+          (contention? reply)
+          (fail (str "Reservation timed out after " *reservation-wait-ms* "ms: "
+                     (str/trim (or (not-empty (:out reply)) (:err reply) ""))))
+
+          :else
+          (fail (str "Reservation refused: "
+                     (str/trim (or (not-empty (:out reply)) (:err reply) "")))))))))
 (defn release! [reservation]
-  (let [reply (shell {:out :string :err :string :continue true :timeout 15000} "orchestrate" (str "Release." (:id reservation)))]
+  (let [reply (*shell* {:out :string :err :string :continue true :timeout 15000} "orchestrate" (str "Release." (:id reservation)))]
     (when-not (and (zero? (:exit reply)) (str/starts-with? (:out reply) "Released."))
       (fail (str "Reservation release failed: " (str/trim (or (not-empty (:out reply)) (:err reply) "")))))))
 (defn with-reservation [flow f]

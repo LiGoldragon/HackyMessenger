@@ -145,6 +145,83 @@
     (store/put-attempt! root attempt)
     (is (= [attempt] (store/attempts-for root "00f95a")))))
 
+(deftest concurrent-sends-wait-for-one-path-lock-with-unique-operation-names
+  (let [root-path (str (fs/create-temp-dir {:prefix "messenger-clj-concurrent-"}))
+        active (atom false)
+        next-id (atom 100)
+        lock-names (atom [])
+        conflict-seen (promise)
+        first-prompt (promise)
+        prompts (atom [])
+        live-route (assoc route :interactive_ready true :agent_status "working")
+        transport (reify hm/HerdrTransport
+                    (live-agents* [_] [live-route])
+                    (target-agent* [_ _] {:agent live-route})
+                    (process-info* [_ _]
+                      {:process_info {:foreground_processes
+                                      [{:argv ["codex" "--thread" (:native_thread route)]}]}})
+                    (pane* [_ _] {:pane route})
+                    (move-pane* [_ _ _ _] {:move_result {}})
+                    (send-keys* [_ _ _] {:ok true})
+                    (prompt!* [_ _ envelope _]
+                      (swap! prompts conj envelope)
+                      (when (= 1 (count @prompts))
+                        (deliver first-prompt true)
+                        (deref conflict-seen 2000 false))
+                      {:ok true}))
+        fake-shell (fn [_ executable query]
+                     (is (= "orchestrate" executable))
+                     (if (str/starts-with? query "Lock.")
+                       (let [operation (second (re-find #"Lock\.\{\s+(\S+)" query))]
+                         (swap! lock-names conj operation)
+                         (if (compare-and-set! active false true)
+                           {:exit 0 :out (str "Locked.{ " (swap! next-id inc)
+                                              " " operation " sender [ /tmp ] test }\n") :err ""}
+                           (do (deliver conflict-seen true)
+                               {:exit 1 :out "LockRejected.PathConflict.{ busy }\n" :err ""})))
+                       (do (reset! active false)
+                           {:exit 0 :out "Released.{ 1 }\n" :err ""})))
+        send-one (fn [body]
+                   (binding [hm/*root* root-path hm/*flow-id* "sender"
+                             hm/*transport* transport hm/*reservation-wait-ms* 2000
+                             hm/*reservation-retry-ms* 1]
+                     (hm/send! "00f95a" body false nil 0)))]
+    (persist-route! root-path route)
+    (binding [hm/*shell* fake-shell]
+      (let [first-send (future (send-one "first"))
+            _ (is (true? (deref first-prompt 2000 false)))
+            second-send (future (send-one "second"))]
+        (is (= "Transported.{ 00f95a working }" (deref first-send 3000 ::timeout)))
+        (is (= "Transported.{ 00f95a working }" (deref second-send 3000 ::timeout)))))
+    (is (= #{"#msg [\"sender\" \"first\"]" "#msg [\"sender\" \"second\"]"}
+           (set @prompts)))
+    (is (= 2 (count @prompts)))
+    (is (= 2 (count (set @lock-names))))
+    (is (every? #(str/starts-with? % "MessengerCljDelivery-") @lock-names))
+    (let [counts (frequencies (map (juxt :body :reason)
+                                   (store/attempts-for root-path "00f95a")))]
+      (is (= 1 (get counts ["first" :Submitting])))
+      (is (= 1 (get counts ["first" :sent])))
+      (is (= 1 (get counts ["second" :Submitting])))
+      (is (= 1 (get counts ["second" :sent]))))))
+
+(deftest reservation-timeout-prompts-and-writes-nothing
+  (let [root-path (str (fs/create-temp-dir {:prefix "messenger-clj-timeout-"}))
+        prompted (atom false)
+        transport (fake-transport route route
+                                  [{:argv ["codex" "--thread" (:native_thread route)]}]
+                                  prompted)]
+    (persist-route! root-path route)
+    (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*transport* transport
+              hm/*reservation-wait-ms* 0 hm/*reservation-retry-ms* 0]
+      (binding [hm/*shell* (fn [& _]
+                            {:exit 1 :out "LockRejected.PathConflict.{ busy }\n" :err ""})]
+        (is (re-find #"Reservation timed out after 0ms"
+                     (try (hm/send! "00f95a" "held" false nil 0)
+                          (catch Exception error (.getMessage error)))))))
+    (is (false? @prompted))
+    (is (empty? (store/attempts-for root-path "00f95a")))))
+
 (deftest held-unregistered-writes-linked-pending-without-prompt
   (let [root (str (fs/create-temp-dir {:prefix "hm-held-"}))
         prompted (atom false)]

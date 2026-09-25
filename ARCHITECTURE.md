@@ -20,12 +20,16 @@ subcommand.
 ## Store
 
 Routes, attempts, pending messages, and retirements share one Datalevin
-database. The existing typed state path is deliberately stable through the
-rename. No operation reads the frozen Python JSON registry as a fallback.
+database at `~/.local/state/messenger-clj`. The first managed deployment from
+the transitional installation must move the old typed root while both paths
+are locked and replace all launchers in the same activation. No operation
+reads the frozen Python JSON registry as a fallback.
 
 Every registry write and send takes an Orchestrate reservation over the state
-root. A send persists its attempt before prompting. Once prompt submission may
-have occurred, uncertainty is recorded and the messenger never retries.
+root. Each operation uses a unique reservation name and waits for path
+contention for a bounded interval. A send persists its attempt before
+prompting. Once prompt submission may have occurred, uncertainty is recorded
+and the messenger never retries.
 
 ## Delivery
 
