@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  "session list --json") printf '%s\n' '{"sessions":[{"name":"s","running":true}]}' ;;
+  "--session s agent list") printf '%s\n' '{"agents":[{"name":"Mind Sol 00f95a","pane_id":"p","terminal_id":"t","agent":"codex","interactive_ready":true,"agent_status":"working"}]}' ;;
+  "--session s agent get p") printf '%s\n' '{"agent":{"name":"Mind Sol 00f95a","pane_id":"p","terminal_id":"t","agent":"codex","interactive_ready":true,"agent_status":"working"}}' ;;
+  *"agent prompt p"*) printf '%s\n' '{"result":{"ok":true}}' ;;
+  *) printf '%s\n' '{"error":{"code":"unexpected"}}'; exit 1 ;;
+esac

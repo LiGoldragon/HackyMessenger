@@ -10,8 +10,8 @@
 (def skill-note "Documented by the compensation-hacky-messenger skill (Curriculum skills/compensation-hacky-messenger.md). Update that skill with any change to this tool.")
 (def failure-reasons #{:NotRegistered :InTransition :RouteHold :IdentityChanged :PaneMissing :NotReady :Blocked :ProcessMismatch :Stalled :Uncertain :Submitting :sent})
 (def delivery-grades #{:Transported :Presented :Fallback-Presented :Held :Uncertain})
-(def FlowId [:string {:min 1 :max 96 :re #"^[A-Za-z0-9][A-Za-z0-9_-]*$"}])
-(def NativeThread [:string {:min 16 :max 96 :re #"^[A-Za-z0-9-]+$"}])
+(def FlowId [:and [:string {:min 1 :max 96}] [:re #"^[A-Za-z0-9][A-Za-z0-9_-]*$"]])
+(def NativeThread [:and [:string {:min 16 :max 96}] [:re #"^[A-Za-z0-9-]+$"]])
 (def MessageBody [:string {:min 1 :max 65536}])
 (def ReadinessProof [:map [:thread_id NativeThread] [:rollout :string] [:marker :string]])
 (def RouteBinding [:map [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string] [:native_thread NativeThread] [:readiness_proof {:optional true} ReadinessProof]])
@@ -171,5 +171,7 @@
           (catch Exception error
             (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } prompt failed or is uncertain: " (.getMessage error)))))))))
 (defn listing! []
-  (let [records (for [p (fs/glob (root) "*.edn")] [(fs/strip-ext (fs/file-name p)) (read-route (fs/strip-ext (fs/file-name p)))])]
+  (let [records (for [p (fs/glob (root) "*.edn")
+                      :when (not= "attempts.edn" (str (fs/file-name p)))]
+                  [(fs/strip-ext (fs/file-name p)) (read-route (fs/strip-ext (fs/file-name p)))])]
     (str/join "\n" (concat ["FLOW\tAGENT\tSESSION\tSTATE"] (map (fn [[f r]] (str f "\t" (:name r) "\t" (:session r) "\tREGISTERED")) records)))))
