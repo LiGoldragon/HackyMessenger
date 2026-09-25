@@ -4,29 +4,29 @@
             [babashka.process :refer [shell]]
             [clojure.edn :as edn]
             [clojure.string :as str]
-            [hacky-messenger.store :as store]
+            [hacky-messenger.typed-store :as store]
             [malli.core :as m]))
 
 (def skill-note "Documented by the compensation-hacky-messenger skill (Curriculum skills/compensation-hacky-messenger.md). Update that skill with any change to this tool.")
-(def failure-reasons #{:NotRegistered :InTransition :RouteHold :IdentityChanged :PaneMissing :NotReady :Blocked :ProcessMismatch :Stalled :Uncertain :RelayOverflow :Submitting :sent})
+(def failure-reasons #{:NotRegistered :NeedsBinding :InTransition :RouteHold :IdentityChanged :PaneMissing :NotReady :Blocked :ProcessMismatch :Stalled :Uncertain :RelayOverflow :Submitting :sent})
 (def delivery-grades #{:Transported :Presented :Fallback-Presented :Held :Uncertain})
 (def FlowId [:and [:string {:min 1 :max 96}] [:re #"^[A-Za-z0-9][A-Za-z0-9_-]*$"]])
 (def NativeThread [:and [:string {:min 16 :max 96}] [:re #"^[A-Za-z0-9-]+$"]])
 (def MessageBody [:string {:min 1 :max 65536}])
 (def ReadinessProof [:map {:closed true} [:thread_id NativeThread] [:rollout :string] [:marker :string] [:evidence_kind {:optional true} :string]])
-(def RouteBinding [:map {:closed true} [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string] [:native_thread NativeThread] [:readiness_proof {:optional true} ReadinessProof] [:route_hold {:optional true} :string] [:transition {:optional true} :boolean] [:state {:optional true} :string]])
+(def RouteBinding [:map {:closed true} [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string] [:native_thread {:optional true} NativeThread] [:readiness_proof {:optional true} ReadinessProof] [:route_hold {:optional true} :string] [:transition {:optional true} :boolean] [:state {:optional true} :string]])
 (def DeliveryAttempt [:map {:closed true} [:id :string] [:at :string] [:flow FlowId] [:reason :keyword] [:grade {:optional true} :keyword] [:binding {:optional true} RouteBinding]])
 (def PendingIntent [:map {:closed true} [:attempt DeliveryAttempt] [:message MessageBody] [:state [:= "held"]]])
 (def RouteIdentity [:map {:closed true} [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string]])
 (def RetirementEvidence [:map {:closed true} [:path :string] [:sha256 [:re #"^[0-9a-f]{64}$"]]])
-(def RetirementMarker [:map {:closed true} [:version [:= 1]] [:state [:= "retired"]] [:flow FlowId] [:record RouteIdentity] [:native_thread NativeThread] [:evidence RetirementEvidence]])
+(def RetirementMarker [:map {:closed true} [:version [:= 1]] [:state [:= "retired"]] [:flow FlowId] [:record RouteIdentity] [:native_thread NativeThread] [:evidence RetirementEvidence] [:retired_by :string] [:retired_at :string]])
 (def Reservation [:map {:closed true} [:id :int] [:flow FlowId] [:root :string]])
 (def MachineRelay [:tuple :string FlowId :string :string [:vector FlowId] MessageBody :string])
 (doseq [schema [FlowId NativeThread MessageBody ReadinessProof RouteBinding DeliveryAttempt PendingIntent RetirementMarker Reservation MachineRelay]] (m/validator schema))
 
 (defn fail [s] (throw (ex-info s {:hm/failure true})))
 (defn valid! [schema value label] (if (m/validate schema value) value (fail (str "Invalid " label ": " (pr-str (m/explain schema value))))))
-(declare atomic-edn! ->EdnLedger record-attempt! record-pending! route-records nonempty-strings!)
+(declare ->DatalevinLedger record-attempt! record-pending! route-records nonempty-strings!)
 (defn flow-id! [value]
   (when-not (and (string? value) (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" value))
     (fail "Flow ID must contain only letters, digits, underscores, or hyphens"))
@@ -34,7 +34,7 @@
 (defn native-thread! [value]
   (when-not (and (string? value) (re-matches #"[A-Za-z0-9-]{16,96}" value)) (fail "Invalid NativeThread"))
   (valid! NativeThread value "NativeThread"))
-(defn route-binding! [value] (valid! RouteBinding value "RouteBinding"))
+(defn route-binding! [value] (valid! RouteBinding (store/route! value) "RouteBinding"))
 (defn delivery-attempt! [value]
   (when-not (and (contains? failure-reasons (:reason value)) (contains? delivery-grades (:grade value)))
     (fail "Invalid DeliveryAttempt grade or reason"))
@@ -51,10 +51,10 @@
 (defprotocol Ledger (record-attempt! [this attempt]) (record-pending! [this attempt body]))
 (defprotocol Clock (current-time [this]))
 (defrecord SystemClock [] Clock (current-time [_] (.toString (java.time.Instant/now))))
-(defrecord EdnRegistry [state-root]
+(defrecord DatalevinRegistry [state-root]
   Registry
-  (load-route [_ flow] (edn/read-string (slurp (str (fs/path state-root (str (flow-id! flow) ".edn"))))))
-  (save-route! [_ flow route] (atomic-edn! (fs/path state-root (str (flow-id! flow) ".edn")) (route-binding! route))))
+  (load-route [_ flow] (store/route-for state-root (flow-id! flow)))
+  (save-route! [_ flow route] (store/put-route! state-root (flow-id! flow) (route-binding! route))))
 (def ^:dynamic *root* nil)
 (def ^:dynamic *flow-id* nil)
 (def ^:dynamic *ledger* nil)
@@ -66,12 +66,10 @@
 ;; `with-reservation` below; tests supply a short-lived in-memory lease.
 (def ^:dynamic *with-reservation* nil)
 (defn root []
-  ;; Clojure EDN records must never share Python's JSON registry by default.
+  ;; Clojure Datalevin state never shares Python's JSON registry.
   (fs/absolutize (or *root* (System/getenv "HM_REGISTRY")
                      (str (fs/path (System/getProperty "user.home") ".local/state/hacky-messenger-clojure")))))
-(defn path [flow] (fs/path (root) (str (flow-id! flow) ".edn")))
-(defn retired-path [flow] (fs/path (root) "retired" (str (flow-id! flow) ".edn")))
-(defn registry [] (or *registry* (->EdnRegistry (root))))
+(defn registry [] (or *registry* (->DatalevinRegistry (root))))
 (defn now [] (current-time (or *clock* (->SystemClock))))
 (defn quote-datom [s] (str "«" (str/replace (str s) #"[\\»]" {\\ "\\\\" \» "\\»"}) "»"))
 (defn relay [sender recipient body]
@@ -92,16 +90,12 @@
           (boolean (some #(and (map? %) (contains? % :machine/relay))
                          (tree-seq coll? seq value))))
         (catch Exception _ false))))
-(defn atomic-edn! [destination value]
-  (fs/create-dirs (fs/parent destination))
-  (let [tmp (fs/path (str destination ".tmp"))]
-    (spit (str tmp) (str (pr-str value) "\n"))
-    (fs/move tmp destination {:replace-existing true})))
 (defn read-route [flow]
-  (let [p (path flow)]
-    (when-not (fs/exists? p) (fail (str "No valid registration for " flow)))
-    (try (route-binding! (load-route (registry) flow))
-         (catch Exception e (fail (str "No valid registration for " flow ": " (.getMessage e)))))))
+  (try
+    (if-let [route (load-route (registry) flow)]
+      (route-binding! route)
+      (fail (str "No valid registration for " flow)))
+    (catch Exception e (fail (str "No valid registration for " flow ": " (.getMessage e))))))
 (defn herdr! [& args]
   (let [{:keys [exit out err]} (apply shell {:out :string :err :string :continue true :timeout 15000} "herdr" args)]
     (when-not (zero? exit) (fail (or (not-empty (str/trim err)) (str "herdr failed: " exit))))
@@ -136,24 +130,24 @@
 (defn sha256 [file]
   (apply str (map #(format "%02x" (bit-and % 0xff)) (.digest (doto (java.security.MessageDigest/getInstance "SHA-256") (.update (fs/read-all-bytes file)))))))
 (defn retirement! [flow]
-  (let [marker (retired-path flow)]
-    (when (fs/exists? marker)
-      (try
-        (let [value (valid! RetirementMarker (edn/read-string (slurp (str marker))) "RetirementMarker")
-              evidence (:evidence value)]
-          (when-not (and (= flow (:flow value)) (fs/absolute? (:path evidence)) (fs/regular-file? (:path evidence))
-                         (= (:sha256 evidence) (sha256 (:path evidence))))
-            (fail "bad marker"))
-          value)
-        (catch Exception _ (fail (str "Retirement marker for " flow " is unavailable or malformed")))))))
+  (when-let [stored (store/retirement-for (root) flow)]
+    (try
+      (let [value (valid! RetirementMarker stored "RetirementMarker")
+            evidence (:evidence value)]
+        (when-not (and (= flow (:flow value)) (fs/absolute? (:path evidence))
+                       (fs/regular-file? (:path evidence))
+                       (= (:sha256 evidence) (sha256 (:path evidence))))
+          (fail "bad marker"))
+        value)
+      (catch Exception _ (fail (str "Retirement marker for " flow " is unavailable or malformed"))))))
 (defn assert-not-retired! [flow]
   (when-let [marker (retirement! flow)]
     (fail (str "Retired: " flow " by " (get-in marker [:evidence :path])))))
 (defn assert-native-not-retired! [native-thread flow]
-  (doseq [marker (fs/glob (fs/path (root) "retired") "*.edn")]
-    (let [other (fs/strip-ext (fs/file-name marker))]
-      (when (and (not= flow other) (= native-thread (:native_thread (retirement! other))))
-        (fail (str "Native thread " native-thread " is retired as Flow " other "; use a fresh native session"))))))
+  (doseq [marker (store/retirements (root))
+          :let [other (:flow marker)]]
+    (when (and (not= flow other) (= native-thread (:native_thread (retirement! other))))
+      (fail (str "Native thread " native-thread " is retired as Flow " other "; use a fresh native session")))))
 (defn claude-session-matches? [process native]
   (and (int? (:pid process))
        (try
@@ -279,16 +273,16 @@
     stored [(fallback-route flow stored nil) true]
     :else [(fallback-route flow nil nil) true]))
 (defn in-transition? [route] (or (:transition route) (= "transition" (:state route))))
+(defn needs-binding? [route] (= "NeedsBinding" (:state route)))
 (defn append-attempt! [flow reason grade route]
   (let [attempt (cond-> {:id (str (java.util.UUID/randomUUID)) :at (now) :flow flow :reason reason :grade grade}
                   route (assoc :binding route))]
     (delivery-attempt! attempt)
-    (fs/create-dirs (root))
-    (record-attempt! (or *ledger* (->EdnLedger (root))) attempt)
+    (record-attempt! (or *ledger* (->DatalevinLedger (root))) attempt)
     ;; The production ledger must be queryable before a prompt may rely on its
     ;; pre-prompt attempt.  Injected test ledgers own their own persistence.
     (when-not *ledger*
-      (when-not (some #(= (first %) (str "attempt/" (:id attempt))) (store/attempts-for (root) flow))
+      (when-not (= attempt (store/attempt-by-id (root) (:id attempt)))
         (fail "Attempt ledger index did not confirm persistence")))
     attempt))
 (defn held-reason [error]
@@ -317,23 +311,22 @@
     (*with-reservation* flow f)
     (let [reservation (reserve! flow)]
       (try (f) (finally (release! reservation))))))
-(defrecord EdnLedger [state-root]
+(defrecord DatalevinLedger [state-root]
   Ledger
   (record-attempt! [_ attempt]
-    (spit (str (fs/path state-root "attempts.edn")) (str (pr-str attempt) "\n") :append true)
-    (store/index-attempt! state-root attempt)
+    (store/put-attempt! state-root attempt)
     attempt)
   (record-pending! [_ attempt body]
-    (store/index-pending! state-root attempt body)
+    (store/put-pending! state-root
+                        (valid! PendingIntent {:attempt attempt :message body :state "held"}
+                                "PendingIntent"))
     attempt))
 (defn held! [flow reason body route]
   (let [attempt (append-attempt! flow reason :Held route)
-        pending (valid! PendingIntent {:attempt attempt :message body :state "held"} "PendingIntent")
-        destination (fs/path (root) "pending" (str (:id attempt) ".edn"))]
-    (atomic-edn! destination pending)
-    (record-pending! (or *ledger* (->EdnLedger (root))) attempt body)
+        pending (valid! PendingIntent {:attempt attempt :message body :state "held"} "PendingIntent")]
+    (record-pending! (or *ledger* (->DatalevinLedger (root))) attempt body)
     (when-not *ledger*
-      (when-not (some #(= (first %) (str "pending/" (:id attempt))) (store/pending-for (root) flow))
+      (when-not (= pending (store/pending-by-id (root) (:id attempt)))
         (fail "Pending ledger index did not confirm persistence")))
     (throw (ex-info (str "Held.{ " flow " " (name reason) " attempt-" (subs (:id attempt) 0 12) " }")
                     {:hm/failure true :hm/held true}))))
@@ -342,7 +335,7 @@
   (with-reservation flow
     (fn []
       (assert-not-retired! flow)
-      (let [existing (when (fs/exists? (path flow)) (read-route flow))]
+      (let [existing (load-route (registry) flow)]
         (when (:route_hold existing) (fail "Registration is held for route repair"))
         (let [agents (if session (:agents (herdr! "--session" session "agent" "list")) (live-agents))
               found (filter #(= name (:name %)) agents)]
@@ -364,7 +357,6 @@
             (when (and existing (not= (:terminal_id existing) (:terminal_id route)))
               (fail "Flow is already registered to a different terminal"))
             (save-route! (registry) flow route)
-            (store/index-route! (root) flow route)
             (str "Registered " flow ": " name " (" session ")")))))))
 (defn nonempty-strings! [label fields]
   (when-not (every? #(and (string? %) (not (str/blank? %))) fields)
@@ -378,7 +370,6 @@
         (when-not (= {:session session :pane_id pane-id :terminal_id terminal-id :name name}
                      (select-keys actual [:session :pane_id :terminal_id :name]))
           (fail "Registration differs from the explicitly revalidated stale route"))
-        (fs/delete (path flow))
         (store/remove-route! (root) flow)
         (str "Deregistered stale " flow ": " name " (" session "/" pane-id "/" terminal-id ")")))))
 (defn retirement-evidence! [evidence-path evidence-sha256]
@@ -401,14 +392,20 @@
             (str "Already retired " flow ": marker retained")
             (fail (str "Flow " flow " already has a different retirement marker")))
           (do
-            (if (fs/exists? (path flow))
-              (when-not (= expected (select-keys (read-route flow) (keys expected)))
+            (if-let [route (store/stored-route-for (root) flow)]
+              (when-not (= expected (select-keys route (keys expected)))
                 (fail "Registration differs from the explicitly revalidated retirement route"))
               (when-not allow-absent?
                 (fail "No current registration; use import-retirement only with retained exact evidence")))
-            (atomic-edn! (retired-path flow)
-                         (valid! RetirementMarker {:version 1 :state "retired" :flow flow :record expected
-                                                   :native_thread native-thread :evidence evidence} "RetirementMarker"))
+            (store/put-retirement!
+             (root)
+             (valid! RetirementMarker
+                     {:version 1 :state "retired" :flow flow :record expected
+                      :native_thread native-thread :evidence evidence
+                      :retired_by (or *flow-id* (System/getenv "FLOW_ID") "")
+                      :retired_at (now)}
+                     "RetirementMarker"))
+            (store/remove-route! (root) flow)
             (str "Retired " flow ": delivery is blocked before Herdr routing")))))))
 (defn rebind! [flow old-name new-name session pane-id terminal-id agent native-thread]
   (flow-id! flow)
@@ -433,15 +430,13 @@
           ;; `verify-target!` checks exact live identity, readiness, blocked
           ;; state, and native process before the registry name is changed.
           (verify-target! replacement)
-          (atomic-edn! (path flow) replacement)
-          (store/index-route! (root) flow replacement)
+          (save-route! (registry) flow replacement)
           (str "Rebound " flow ": " old-name " -> " new-name " (" session "/" pane-id "/" terminal-id ")"))))))
 (defn move-route! [flow record pane-id hold?]
   (let [replacement (cond-> (assoc record :pane_id pane-id)
                       hold? (assoc :route_hold "pane_move_in_progress")
                       (not hold?) (dissoc :route_hold))]
-    (atomic-edn! (path flow) replacement)
-    (store/index-route! (root) flow replacement)
+    (save-route! (registry) flow replacement)
     replacement))
 (defn pane-value [reply] (or (:pane reply) reply))
 (defn move-result-value [reply] (or (:move_result reply) reply))
@@ -528,6 +523,7 @@
       (fn []
         (assert-not-retired! flow)
         (let [route (read-route flow)]
+          (when (needs-binding? route) (held! flow :NeedsBinding body route))
           (when (in-transition? route) (held! flow :InTransition body route))
           (when (:route_hold route) (held! flow :RouteHold body route))
           (let [live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) body route)))
@@ -581,6 +577,7 @@
                             (try (read-route flow) (catch Exception _ nil)))
                         stored)]
            (when (in-transition? stored) (held! flow :InTransition body stored))
+           (when (needs-binding? stored) (held! flow :NeedsBinding body stored))
            (when (:route_hold stored) (held! flow :RouteHold body stored))
            (let [[route fallback?] (try (resolve-send-route flow stored pane)
                                         (catch Exception _ (held! flow (if stored :PaneMissing :NotRegistered) body stored)))
@@ -600,18 +597,8 @@
                        (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12)
                                   " } prompt failed or is uncertain: " (.getMessage error))))))))))))))
 (defn route-records []
-  (let [indexed-flows (set (map first (store/routes-for (root))))]
-    ;; The EDN binding remains the PoC's readable source record.  Datalevin
-    ;; names the bindings and delivery history that belong in this view.
-    (doseq [flow indexed-flows] (store/attempts-for (root) flow))
-    (into {}
-          (for [p (fs/glob (root) "*.edn")
-                :let [flow (fs/strip-ext (fs/file-name p))]
-                :when (and (contains? indexed-flows flow)
-                           (string? flow)
-                           (not= "attempts" flow)
-                           (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" flow))]
-            [flow (read-route flow)]))))
+  (into {} (remove (fn [[flow _]] (store/retirement-for (root) flow))
+                   (store/routes (root)))))
 (defn route-matches-agent? [route agent]
   (and (= (:session route) (:session agent))
        (= (:name route) (:name agent))

@@ -5,13 +5,15 @@
             [cheshire.core :as json]
             [malli.core]
             [hacky-messenger.core :as hm]
-            [hacky-messenger.store :as store]
+            [hacky-messenger.typed-store :as store]
             [babashka.fs :as fs]))
 
 (def route {:session "s" :name "Mind Sol 00f95a" :pane_id "p" :terminal_id "t"
             :agent "codex" :native_thread "00000000-0000-0000-0000-000000000000"})
 
 (defn pass-reservation [_ f] (f))
+(defn persist-route! [root-path value]
+  (store/put-route! root-path "00f95a" value))
 (defn fake-transport [live-agent target-agent processes prompts]
   (reify hm/HerdrTransport
     (live-agents* [_] [live-agent])
@@ -48,8 +50,8 @@
 
 (deftest identifiers-and-title-fallback-are-strict
   (is (false? (malli.core/validate hm/FlowId "../../etc/x")))
-  (is (thrown? Exception (hm/path "../../etc/x")))
-  (is (thrown? Exception (hm/path "a b!")))
+  (is (thrown? Exception (hm/flow-id! "../../etc/x")))
+  (is (thrown? Exception (hm/flow-id! "a b!")))
   (is (= {:session "test" :pane_id "w1:p2"} (hm/parse-pane "test:w1:p2")))
   (with-redefs [hm/live-agents (constantly [(assoc route :name "Mind Sol 00f95a")])]
     (is (= "p" (:pane_id (first (hm/resolve-send-route "00f95a" nil nil))))))
@@ -91,8 +93,7 @@
                                 (send-keys* [_ _ key] (swap! events conj [:key key]) {:ok true})
                                 (prompt!* [_ _ _ wait?] (swap! events conj [:prompt wait?]) reply))]
                 (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation hm/*transport* transport]
-                  (hm/atomic-edn! (hm/path "00f95a") record)
-                  (store/index-route! root-path "00f95a" record)
+                  (persist-route! root-path record)
                   [(try (hm/send-abrupt! "00f95a" "receipt" true)
                         (catch Exception error (.getMessage error))) @events])))]
     (let [[result events] (run route {:presented true} route)]
@@ -108,15 +109,14 @@
       (is (re-find #"Held\.\{ 00f95a" result))
       (is (empty? events)))))
 
-(deftest datalevin-pod-indexes-and-queries-attempts
+(deftest datalevin-pod-stores-and-queries-typed-attempts
   (let [root (str (fs/create-temp-dir {:prefix "hm-datalevin-"}))
         attempt {:id "attempt-1" :at "2026-09-25T00:00:00Z" :flow "00f95a"
                  :reason :NotRegistered :grade :Held}]
-    (store/index-attempt! root attempt)
-    (is (= #{["attempt/attempt-1" :NotRegistered]}
-           (store/attempts-for root "00f95a")))))
+    (store/put-attempt! root attempt)
+    (is (= [attempt] (store/attempts-for root "00f95a")))))
 
-(deftest held-unregistered-writes-edn-and-datalog-pending-without-prompt
+(deftest held-unregistered-writes-linked-pending-without-prompt
   (let [root (str (fs/create-temp-dir {:prefix "hm-held-"}))
         prompted (atom false)]
     (binding [hm/*root* root hm/*flow-id* "sender" hm/*with-reservation* pass-reservation]
@@ -127,10 +127,26 @@
                            (catch Exception error (.getMessage error)))]
           (is (re-find #"Held\.\{ 00f95a NotRegistered" message))
           (is (false? @prompted))
-          (is (= 1 (count (fs/glob (fs/path root "pending") "*.edn"))))
-          (is (= #{["pending/" :NotRegistered]}
-                 (set (map (fn [[identity reason]] [(subs identity 0 8) reason])
-                           (store/pending-for root "00f95a"))))))))))
+          (is (= 1 (count (store/pending-for root "00f95a"))))
+          (is (= :NotRegistered
+                 (get-in (first (store/pending-for root "00f95a"))
+                         [:attempt :reason]))))))))
+
+(deftest needs-binding-route-is-held-before-herdr
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-needs-binding-"}))
+        prompted (atom false)]
+    (binding [hm/*root* root-path hm/*flow-id* "sender"
+              hm/*with-reservation* pass-reservation]
+      (persist-route! root-path (dissoc route :native_thread))
+      (with-redefs [hm/live-agents (constantly [route])
+                    hm/direct-prompt! (fn [& _] (reset! prompted true))]
+        (let [message (try (hm/send! "00f95a" "held body" false nil 0)
+                           (catch Exception error (.getMessage error)))]
+          (is (re-find #"Held\.\{ 00f95a NeedsBinding" message))
+          (is (false? @prompted))
+          (is (= :NeedsBinding
+                 (get-in (first (store/pending-for root-path "00f95a"))
+                         [:attempt :reason]))))))))
 
 (deftest fallback-order-and-grades-are-explicit
   (with-redefs [hm/live-agents (constantly [route])]
@@ -144,7 +160,7 @@
 (deftest fallback-presentation-requires-an-observed-wait-without-retry
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-send-"}))]
     (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation]
-      (hm/atomic-edn! (hm/path "00f95a") route)
+      (persist-route! root-path route)
       (let [calls (atom [])]
         (with-redefs [hm/live-agents (constantly [(assoc route :pane_id "moved")])
                       hm/verify-target! (fn [_] route)
@@ -177,7 +193,7 @@
                   (record-attempt! [_ _] (hm/fail "ledger unavailable"))
                   (record-pending! [_ _ _] nil))]
     (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*ledger* failing hm/*with-reservation* pass-reservation]
-      (hm/atomic-edn! (hm/path "00f95a") route)
+      (persist-route! root-path route)
       (with-redefs [hm/live-agents (constantly [route])
                     hm/verify-target! (fn [_] route)
                     hm/direct-prompt! (fn [& _] (swap! prompts inc))]
@@ -195,17 +211,16 @@
                       (binding [hm/*root* root-path hm/*flow-id* "sender"
                                 hm/*with-reservation* pass-reservation
                                 hm/*transport* (fake-transport good-agent target-agent processes prompts)]
-                        (hm/atomic-edn! (hm/path "00f95a") route)
+                        (persist-route! root-path route)
                         (try (hm/send! "00f95a" "body" false nil)
                              (catch Exception error (.getMessage error)))))]
     (is (re-find #"IdentityChanged" (send-result (assoc good-agent :agent "other") good-process)))
     (is (re-find #"NotReady" (send-result (assoc good-agent :interactive_ready false) good-process)))
     (is (re-find #"ProcessMismatch" (send-result good-agent [{:argv ["codex" "--thread" "different"]}])))
     (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation]
-      (hm/atomic-edn! (hm/retired-path "00f95a") {:flow "00f95a" :record route :native_thread (:native_thread route)})
-      (is (re-find #"Retirement marker" (try (hm/send! "00f95a" "body" false nil)
-                                             (catch Exception error (.getMessage error)))))
-      (fs/delete (hm/retired-path "00f95a")))
+      (with-redefs [store/retirement-for (fn [_ flow] (when (= flow "00f95a") {:malformed true}))]
+        (is (re-find #"Retirement marker" (try (hm/send! "00f95a" "body" false nil)
+                                               (catch Exception error (.getMessage error)))))))
     (binding [hm/*root* root-path hm/*flow-id* "sender"
               hm/*with-reservation* (fn [_ _] (hm/fail "Reservation refused"))
               hm/*transport* (fake-transport good-agent good-agent good-process prompts)]
@@ -222,13 +237,13 @@
         process [{:argv ["codex" "--thread" (:native_thread route)]}]
         transport (fake-transport good-agent good-agent process prompts)]
     (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation hm/*transport* transport]
-      (hm/atomic-edn! (hm/path "00f95a") (assoc route :route_hold "pane_move_in_progress"))
+      (persist-route! root-path (assoc route :route_hold "pane_move_in_progress"))
       (is (re-find #"RouteHold" (try (hm/send! "00f95a" "body" false nil) (catch Exception error (.getMessage error)))))
       (is (re-find #"RouteHold" (try (hm/send-abrupt! "00f95a" "body" false) (catch Exception error (.getMessage error)))))
       (is (zero? @prompts))
-      (hm/atomic-edn! (hm/path "00f95a") route)
+      (persist-route! root-path route)
       (is (re-find #"RelayOverflow" (try (hm/send! "00f95a" (apply str (repeat 790 "x")) false nil) (catch Exception error (.getMessage error)))))
-      (is (pos? (count (fs/glob (fs/path root-path "pending") "*.edn"))))
+      (is (pos? (count (store/pending-for root-path "00f95a"))))
       (let [writes (atom 0)
             ledger (reify hm/Ledger
                      (record-attempt! [_ _] (if (= 2 (swap! writes inc)) (hm/fail "sent ledger unavailable") :ok))
@@ -238,24 +253,20 @@
                        (try (hm/send! "00f95a" "body" false nil) (catch Exception error (.getMessage error)))))
           (is (= 1 @prompts)))))))
 
-(deftest listing-joins-live-agents-and-never-reads-ledger-files-as-routes
+(deftest listing-joins-live-agents-from-typed-routes
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-list-"}))
         second-agent {:session "s" :name "Other 123" :pane_id "x" :terminal_id "u" :agent "codex" :agent_status "idle"}]
     (binding [hm/*root* root-path]
-      (hm/atomic-edn! (hm/path "00f95a") route)
-      (store/index-route! root-path "00f95a" route)
-      (hm/atomic-edn! (fs/path root-path "attempts.edn") {:not "a route"})
-      (hm/atomic-edn! (fs/path root-path "pending" "not-a-route.edn") {:not "a route"})
+      (persist-route! root-path route)
       (with-redefs [hm/live-agents (constantly [(assoc route :agent_status "working") second-agent])]
         (is (= (str "FLOW\tAGENT\tSESSION\tSTATE\n"
                     "00f95a\tMind Sol 00f95a\ts\tworking\n"
                     "-\tOther 123\ts\tidle")
                (hm/listing!)))
         (let [queried (atom [])]
-          (with-redefs [store/routes-for (fn [_] (swap! queried conj :routes) #{["00f95a"]})
-                        store/attempts-for (fn [_ flow] (swap! queried conj [:attempts flow]) #{})]
+          (with-redefs [store/routes (fn [_] (swap! queried conj :routes) {"00f95a" route})]
             (hm/listing!)
-            (is (= [:routes [:attempts "00f95a"]] @queried)))))
+            (is (= [:routes] @queried)))))
       (with-redefs [hm/live-agents (constantly [])]
         (is (= (str "FLOW\tAGENT\tSESSION\tSTATE\n"
                     "00f95a\tMind Sol 00f95a\ts\tSTALE")
@@ -313,14 +324,11 @@
         process [{:argv ["codex" "--thread" (:native_thread route)]}]
         rebound (assoc route :name "Mind Sol renamed" :interactive_ready true :agent_status "working")]
     (binding [hm/*root* root-path hm/*with-reservation* pass-reservation]
-      (hm/atomic-edn! (hm/path "00f95a") route)
-      (store/index-route! root-path "00f95a" route)
+      (persist-route! root-path route)
       (is (= "Deregistered stale 00f95a: Mind Sol 00f95a (s/p/t)"
              (hm/deregister! "00f95a" "s" "p" "t" "Mind Sol 00f95a")))
-      (is (false? (fs/exists? (hm/path "00f95a"))))
-      (is (empty? (store/routes-for root-path)))
-      (hm/atomic-edn! (hm/path "00f95a") route)
-      (store/index-route! root-path "00f95a" route)
+      (is (nil? (store/route-for root-path "00f95a")))
+      (persist-route! root-path route)
       (binding [hm/*transport* (fake-transport rebound rebound process (atom 0))]
         (is (= "Rebound 00f95a: Mind Sol 00f95a -> Mind Sol renamed (s/p/t)"
                (hm/rebind! "00f95a" "Mind Sol 00f95a" "Mind Sol renamed" "s" "p" "t" "codex" (:native_thread route))))
@@ -334,8 +342,7 @@
                  (let [moves (atom "p")]
                    (binding [hm/*root* root-path hm/*with-reservation* pass-reservation
                              hm/*transport* (move-transport route mode moves)]
-                     (hm/atomic-edn! (hm/path "00f95a") route)
-                     (store/index-route! root-path "00f95a" route)
+                     (persist-route! root-path route)
                      [(try (hm/move! "00f95a" "s" "p" "t" "Mind Sol 00f95a" "codex" (:native_thread route) 123 "w2")
                            (catch Exception error (.getMessage error)))
                       (hm/read-route "00f95a")])))]
@@ -353,7 +360,7 @@
     (let [moves (atom "p")]
       (binding [hm/*root* root-path hm/*with-reservation* pass-reservation
                 hm/*transport* (move-transport route :success moves)]
-        (hm/atomic-edn! (hm/path "00f95a") (assoc route :route_hold "pane_move_in_progress"))
+        (persist-route! root-path (assoc route :route_hold "pane_move_in_progress"))
         (is (thrown? Exception (hm/move! "00f95a" "s" "p" "t" "Mind Sol 00f95a" "codex" (:native_thread route) 123 "w2")))
         (is (= "p" @moves))))))
 
@@ -362,7 +369,7 @@
         evidence (fs/create-temp-file {:prefix "hm-evidence-"})]
     (spit (str evidence) "witness")
     (binding [hm/*root* root-path hm/*with-reservation* pass-reservation]
-      (hm/atomic-edn! (hm/path "00f95a") route)
+      (persist-route! root-path route)
       (let [digest (hm/sha256 evidence)]
         (is (= "Retired 00f95a: delivery is blocked before Herdr routing"
                (hm/retire! "00f95a" "s" "p" "t" "Mind Sol 00f95a" "codex" (:native_thread route) evidence digest false)))
@@ -371,8 +378,7 @@
         (is (thrown? Exception (hm/assert-not-retired! "00f95a")))
         (is (thrown? Exception (hm/assert-native-not-retired! (:native_thread route) "other-flow")))
         (is (thrown? Exception (hm/retire! "00f95a" "s" "other" "t" "Mind Sol 00f95a" "codex" (:native_thread route) evidence digest false)))
-        (fs/create-dirs (fs/parent (hm/retired-path "broken")))
-        (spit (str (hm/retired-path "broken")) "{:bad true}")
-        (is (thrown? Exception (hm/assert-not-retired! "broken")))
+        (with-redefs [store/retirement-for (fn [_ flow] (when (= flow "broken") {:bad true}))]
+          (is (thrown? Exception (hm/assert-not-retired! "broken"))))
         (is (= "Retired imported: delivery is blocked before Herdr routing"
                (hm/retire! "imported" "s" "p" "t" "Mind Sol 00f95a" "codex" (:native_thread route) evidence digest true)))))))

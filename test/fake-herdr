@@ -1,22 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
+pane="p"
+if [[ -n "${FAKE_HERDR_STATE:-}" && -f "$FAKE_HERDR_STATE" ]]; then pane="$(<"$FAKE_HERDR_STATE")"; fi
 case "$*" in
   "session list --json")
     if [[ "${FAKE_HERDR_LIST:-ok}" == fail ]]; then printf '%s\n' '{"error":{"code":"unavailable"}}'; exit 1; fi
     printf '%s\n' '{"sessions":[{"name":"s","running":true}]}' ;;
   "--session s agent list")
     if [[ "${FAKE_HERDR_AGENT_LIST:-live}" == empty ]]; then printf '%s\n' '{"agents":[]}'; else
-      printf '%s\n' '{"agents":[{"name":"Mind Sol 00f95a","pane_id":"p","terminal_id":"t","agent":"codex","interactive_ready":true,"agent_status":"working"}]}'
+      printf '{"agents":[{"name":"Mind Sol 00f95a","pane_id":"%s","terminal_id":"t","agent":"codex","interactive_ready":true,"agent_status":"working"}]}\n' "$pane"
     fi ;;
-  "--session s agent get p") printf '%s\n' '{"agent":{"name":"Mind Sol 00f95a","pane_id":"p","terminal_id":"t","agent":"codex","interactive_ready":true,"agent_status":"working"}}' ;;
-  "--session s pane process-info --pane p") printf '%s\n' '{"process_info":{"foreground_processes":[{"argv":["codex","--thread","00000000-0000-0000-0000-000000000000"]}]}}' ;;
-  "--session s agent send-keys p esc"|"--session s agent send-keys p enter") printf '%s\n' '{"result":{"ok":true}}' ;;
-  *"agent prompt p"*"--wait"*)
+  "--session s agent get "*)
+    printf '{"agent":{"name":"Mind Sol 00f95a","pane_id":"%s","terminal_id":"t","agent":"codex","interactive_ready":true,"agent_status":"working"}}\n' "$pane" ;;
+  "--session s pane process-info --pane "*)
+    printf '%s\n' '{"process_info":{"foreground_processes":[{"pid":123,"argv":["codex","--thread","00000000-0000-0000-0000-000000000000"]}]}}' ;;
+  "--session s pane get "*)
+    printf '{"pane":{"pane_id":"%s","terminal_id":"t","agent":"codex","workspace_id":"%s"}}\n' "$pane" "$(if [[ "$pane" == p ]]; then printf w1; else printf w2; fi)" ;;
+  "--session s pane move "*"--new-tab --workspace w2 --label Mind Sol 00f95a --no-focus")
+    [[ -n "${FAKE_HERDR_STATE:-}" ]] && printf '%s' m > "$FAKE_HERDR_STATE"
+    printf '%s\n' '{"move_result":{"previous_pane_id":"p","previous_workspace_id":"w1","pane":{"pane_id":"m","terminal_id":"t","agent":"codex","workspace_id":"w2"}}}' ;;
+  "--session s agent send-keys "*" esc"|"--session s agent send-keys "*" enter") printf '%s\n' '{"result":{"ok":true}}' ;;
+  *"agent prompt "*"--wait"*)
     case "${FAKE_HERDR_WAIT:-presented}" in
       presented) printf '%s\n' '{"result":{"presented":true}}' ;;
       submitted) printf '%s\n' '{"result":{"ok":true}}' ;;
       timeout) printf '%s\n' '{"error":{"code":"agent_prompt_stalled"}}'; exit 1 ;;
     esac ;;
-  *"agent prompt p"*) printf '%s\n' '{"result":{"ok":true}}' ;;
+  *"agent prompt "*) printf '%s\n' '{"result":{"ok":true}}' ;;
   *) printf '%s\n' '{"error":{"code":"unexpected"}}'; exit 1 ;;
 esac
