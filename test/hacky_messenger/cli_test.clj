@@ -15,6 +15,45 @@
   (apply shell {:out :string :err :string :continue true :extra-env environment}
          (str (fs/absolutize (fs/path "bin" wrapper))) arguments))
 
+(defn fake-herdr-environment []
+  (let [root (str (fs/create-temp-dir {:prefix "hm-cli-presented-"}))
+        tools (fs/create-temp-dir {:prefix "hm-cli-presented-tools-"})
+        prompt-log (str (fs/path root "prompts.edn"))
+        herdr (fs/path tools "herdr")
+        orchestrate (fs/path tools "orchestrate")]
+    (fs/copy "test/fake-herdr" herdr)
+    (spit (str orchestrate)
+          "#!/usr/bin/env bash\ncase \"$1\" in Lock.*) echo 'Locked.{ 1 Test sender [ /tmp ] test }';; Release.*) echo 'Released.{ 1 Test sender [ /tmp ] test }';; esac\n")
+    (.setExecutable (java.io.File. (str herdr)) true)
+    (.setExecutable (java.io.File. (str orchestrate)) true)
+    {:root root :tools tools :prompt-log prompt-log
+     :environment {"PATH" (str tools ":" (System/getenv "PATH"))
+                   "HM_REGISTRY" root "HM_PRIMARY_ROOT" root "FLOW_ID" "sender"
+                   "FAKE_HERDR_PROMPT_LOG" prompt-log}}))
+
+(deftest wait-presented-cli-uses-one-fake-herdr-prompt-and-durable-grades
+  (doseq [[wait-result expected-grade expected-exit]
+          [["presented" :Presented 0]
+           ["submitted" :Uncertain 1]
+           ["timeout" :Uncertain 1]]]
+    (let [{:keys [root tools prompt-log environment]} (fake-herdr-environment)
+          env (assoc environment "FAKE_HERDR_WAIT" wait-result)]
+      (try
+        (is (zero? (:exit (invoke env "hm-clj-register" "00f95a" "Mind Sol 00f95a"
+                                  "--session" "s" "--native-thread" native-thread))))
+        (let [sent (invoke env "hm-clj-send" "00f95a" (str "wait-" wait-result) "--wait-presented")
+              attempts (store/attempts-for root "00f95a")]
+          (is (= expected-exit (:exit sent)) (str wait-result ": " (:err sent)))
+          (is (str/includes? (str (:out sent) (:err sent)) (name expected-grade)))
+          (is (= 1 (count (str/split-lines (slurp prompt-log)))))
+          (is (= (str "#msg [\"sender\" \"wait-" wait-result "\"]")
+                 (first (str/split-lines (slurp prompt-log)))))
+          (is (= 1 (count (filter #(= :Submitting (:reason %)) attempts))))
+          (is (= expected-grade (:grade (last attempts)))))
+        (finally
+          (fs/delete-tree root)
+          (fs/delete-tree tools))))))
+
 (deftest public-json-import-wrapper-is-dry-run-by-default-and-requires-apply
   (let [{:keys [source]} (legacy-test/fixture!)
         target (str (fs/path (fs/create-temp-dir {:prefix "hm-cli-import-target-"}) "target"))

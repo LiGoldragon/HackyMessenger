@@ -215,6 +215,27 @@
                             (catch Exception error (.getMessage error)))))
           (is (= 1 @calls)))))))
 
+(deftest plain-wait-presented-needs-the-supported-observation
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-presented-"}))
+        invoke (fn [reply]
+                 (let [calls (atom [])]
+                   (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation]
+                     (persist-route! root-path route)
+                     (with-redefs [hm/live-agents (constantly [route])
+                                   hm/verify-target! (fn [_] route)
+                                   hm/direct-prompt! (fn [& args] (swap! calls conj args) reply)]
+                       [(try (hm/send! "00f95a" "plain wait" true nil)
+                             (catch Exception error (.getMessage error)))
+                        @calls]))))]
+    (let [[result calls] (invoke {:presented true})]
+      (is (= "Presented.{ 00f95a unknown }" result))
+      (is (= 1 (count calls)))
+      (is (true? (nth (first calls) 2))))
+    (let [[result calls] (invoke {:ok true})]
+      (is (re-find #"Uncertain\.\{ 00f95a" result))
+      (is (= 1 (count calls)))
+      (is (true? (nth (first calls) 2))))))
+
 (deftest ledger-failure-prevents-the-live-send-prompt
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-ledger-"}))
         prompts (atom 0)

@@ -655,8 +655,9 @@
                  submission (append-attempt! flow :Submitting :Uncertain route body)
                  grade (if fallback? :Fallback-Presented (if wait-presented :Presented :Transported))]
              (try
-               (let [reply (prompt!* (transport) route envelope (or fallback? wait-presented))]
-                 (when fallback? (presented! reply)))
+               (let [waited? (or fallback? wait-presented)
+                     reply (prompt!* (transport) route envelope waited?)]
+                 (when waited? (presented! reply)))
                (verify-target! route)
                (record-sent! flow grade route submission live body)
                (catch Exception error
