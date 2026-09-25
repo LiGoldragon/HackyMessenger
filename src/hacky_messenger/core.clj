@@ -26,7 +26,8 @@
 (defn valid! [schema value label] (if (m/validate schema value) value (fail (str "Invalid " label ": " (pr-str (m/explain schema value))))))
 (declare atomic-edn! ->EdnLedger record-attempt! record-pending!)
 (defn flow-id! [value]
-  (when-not (and (string? value) (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" value)) (fail "Invalid FlowId"))
+  (when-not (and (string? value) (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" value))
+    (fail "Flow ID must contain only letters, digits, underscores, or hyphens"))
   (valid! FlowId value "FlowId"))
 (defn native-thread! [value]
   (when-not (and (string? value) (re-matches #"[A-Za-z0-9-]{16,96}" value)) (fail "Invalid NativeThread"))
@@ -72,6 +73,11 @@
     (when-not (= {:machine/relay positions} (edn/read-string line))
       (fail "Machine.Relay EDN round trip failed; message held"))
     line))
+(defn nested-relay? [body]
+  (try
+    (let [value (edn/read-string body)]
+      (and (map? value) (contains? value :machine/relay)))
+    (catch Exception _ false)))
 (defn atomic-edn! [destination value]
   (fs/create-dirs (fs/parent destination))
   (let [tmp (fs/path (str destination ".tmp"))]
@@ -83,7 +89,7 @@
     (try (route-binding! (load-route (->EdnRegistry (root)) flow))
          (catch Exception e (fail (str "No valid registration for " flow ": " (.getMessage e)))))))
 (defn herdr! [& args]
-  (let [{:keys [exit out err]} (apply shell {:out :string :err :string :timeout 15000} "herdr" args)]
+  (let [{:keys [exit out err]} (apply shell {:out :string :err :string :continue true :timeout 15000} "herdr" args)]
     (when-not (zero? exit) (fail (or (not-empty (str/trim err)) (str "herdr failed: " exit))))
     (try (let [reply (json/parse-string out true)] (if (:error reply) (fail (str "Herdr: " (:error reply))) (or (:result reply) reply)))
          (catch Exception _ (fail "Herdr returned invalid JSON; do not blindly retry a send")))))
@@ -140,8 +146,8 @@
           (filter :running (:sessions (herdr! "session" "list" "--json")))))
 (defn live-agents [] (live-agents* (transport)))
 (defn parse-pane [value]
-  (let [[session pane & extra] (str/split (or value "") #":" 3)]
-    (when (or (str/blank? session) (str/blank? pane) (seq extra)) (fail "--pane requires <session>:<pane>"))
+  (let [[session pane] (str/split (or value "") #":" 2)]
+    (when (or (str/blank? session) (str/blank? pane)) (fail "--pane requires <session>:<pane>"))
     {:session session :pane_id pane}))
 (defn fallback-route [flow stored pane]
   (cond
@@ -174,7 +180,13 @@
                   route (assoc :binding route))]
     (delivery-attempt! attempt)
     (fs/create-dirs (root))
-    (record-attempt! (or *ledger* (->EdnLedger (root))) attempt)))
+    (record-attempt! (or *ledger* (->EdnLedger (root))) attempt)
+    ;; The production ledger must be queryable before a prompt may rely on its
+    ;; pre-prompt attempt.  Injected test ledgers own their own persistence.
+    (when-not *ledger*
+      (when-not (some #(= (first %) (str "attempt/" (:id attempt))) (store/attempts-for (root) flow))
+        (fail "Attempt ledger index did not confirm persistence")))
+    attempt))
 (defn reserve! [flow]
   (let [owner (flow-id! (or *flow-id* (System/getenv "FLOW_ID") flow))
         reply (shell {:out :string :err :string :timeout 15000}
@@ -208,9 +220,13 @@
         destination (fs/path (root) "pending" (str (:id attempt) ".edn"))]
     (atomic-edn! destination pending)
     (record-pending! (or *ledger* (->EdnLedger (root))) attempt body)
-    (fail (str "Held.{ " flow " " (name reason) " attempt-" (subs (:id attempt) 0 12) " }"))))
+    (when-not *ledger*
+      (when-not (some #(= (first %) (str "pending/" (:id attempt))) (store/pending-for (root) flow))
+        (fail "Pending ledger index did not confirm persistence")))
+    (throw (ex-info (str "Held.{ " flow " " (name reason) " attempt-" (subs (:id attempt) 0 12) " }")
+                    {:hm/failure true :hm/held true}))))
 (defn register! [flow name session native-thread]
-  (valid! FlowId flow "FlowId") (valid! NativeThread native-thread "NativeThread")
+  (flow-id! flow) (native-thread! native-thread)
   (let [agents (:agents (herdr! "--session" session "agent" "list"))
         found (filter #(= name (:name %)) agents)]
     (when-not (= 1 (count found)) (fail (str "Expected one live agent named " name "; found " (count found) ". Use --session.")))
@@ -219,8 +235,9 @@
       (store/index-route! (root) flow route)
       (str "Registered " flow ": " name " (" session ")"))))
 (defn send! [flow body wait-presented pane]
-  (valid! FlowId flow "FlowId") (valid! MessageBody body "MessageBody")
+  (flow-id! flow) (valid! MessageBody body "MessageBody")
   (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))
+  (when (nested-relay? body) (fail "Nested Machine.Relay is not a message body"))
   (let [sender (or *flow-id* (System/getenv "FLOW_ID") (fail "Set FLOW_ID to your own flow ID before sending"))]
     (with-reservation flow
       (fn []
@@ -244,8 +261,33 @@
                   (str (name grade) ".{ " flow " " (or (:agent_status live) "unknown") " }"))
                 (catch Exception error
                   (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } prompt failed or is uncertain: " (.getMessage error))))))))))))
+(defn route-records []
+  (into {}
+        (for [p (fs/glob (root) "*.edn")
+              :let [flow (fs/strip-ext (fs/file-name p))]
+              :when (and (string? flow)
+                         (not= "attempts" flow)
+                         (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" flow))]
+          [flow (read-route flow)])))
+(defn route-matches-agent? [route agent]
+  (and (= (:session route) (:session agent))
+       (= (:name route) (:name agent))
+       (= (:pane_id route) (:pane_id agent))
+       (= (:terminal_id route) (:terminal_id agent))
+       (= (:agent route) (:agent agent))))
 (defn listing! []
-  (let [records (for [p (fs/glob (root) "*.edn")
-                      :when (not= "attempts.edn" (str (fs/file-name p)))]
-                  [(fs/strip-ext (fs/file-name p)) (read-route (fs/strip-ext (fs/file-name p)))])]
-    (str/join "\n" (concat ["FLOW\tAGENT\tSESSION\tSTATE"] (map (fn [[f r]] (str f "\t" (:name r) "\t" (:session r) "\tREGISTERED")) records)))))
+  (let [records (route-records)
+        agents (live-agents)
+        live-rows (for [agent agents
+                        :let [flows (->> records
+                                         (keep (fn [[flow route]] (when (route-matches-agent? route agent) flow)))
+                                         sort)]]
+                    (str (if (seq flows) (str/join "," flows) "-") "\t"
+                         (or (:name agent) "-") "\t" (:session agent) "\t"
+                         (or (:agent_status agent) "unknown")))
+        matched (set (mapcat (fn [agent]
+                               (keep (fn [[flow route]] (when (route-matches-agent? route agent) flow)) records))
+                             agents))
+        stale-rows (for [[flow route] (sort-by key (remove (fn [[flow _]] (contains? matched flow)) records))]
+                     (str flow "\t" (:name route) "\t" (:session route) "\tSTALE"))]
+    (str/join "\n" (concat ["FLOW\tAGENT\tSESSION\tSTATE"] live-rows stale-rows))))

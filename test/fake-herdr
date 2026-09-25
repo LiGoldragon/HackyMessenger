@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 case "$*" in
-  "session list --json") printf '%s\n' '{"sessions":[{"name":"s","running":true}]}' ;;
-  "--session s agent list") printf '%s\n' '{"agents":[{"name":"Mind Sol 00f95a","pane_id":"p","terminal_id":"t","agent":"codex","interactive_ready":true,"agent_status":"working"}]}' ;;
+  "session list --json")
+    if [[ "${FAKE_HERDR_LIST:-ok}" == fail ]]; then printf '%s\n' '{"error":{"code":"unavailable"}}'; exit 1; fi
+    printf '%s\n' '{"sessions":[{"name":"s","running":true}]}' ;;
+  "--session s agent list")
+    if [[ "${FAKE_HERDR_AGENT_LIST:-live}" == empty ]]; then printf '%s\n' '{"agents":[]}'; else
+      printf '%s\n' '{"agents":[{"name":"Mind Sol 00f95a","pane_id":"p","terminal_id":"t","agent":"codex","interactive_ready":true,"agent_status":"working"}]}'
+    fi ;;
   "--session s agent get p") printf '%s\n' '{"agent":{"name":"Mind Sol 00f95a","pane_id":"p","terminal_id":"t","agent":"codex","interactive_ready":true,"agent_status":"working"}}' ;;
   "--session s pane process-info --pane p") printf '%s\n' '{"process_info":{"foreground_processes":[{"argv":["codex","--thread","00000000-0000-0000-0000-000000000000"]}]}}' ;;
   *"agent prompt p"*"--wait"*)

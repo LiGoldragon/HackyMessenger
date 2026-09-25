@@ -21,6 +21,7 @@
   (is (false? (malli.core/validate hm/FlowId "../../etc/x")))
   (is (thrown? Exception (hm/path "../../etc/x")))
   (is (thrown? Exception (hm/path "a b!")))
+  (is (= {:session "test" :pane_id "w1:p2"} (hm/parse-pane "test:w1:p2")))
   (with-redefs [hm/live-agents (constantly [(assoc route :name "Mind Sol 00f95a")])]
     (is (= "p" (:pane_id (first (hm/resolve-send-route "00f95a" nil nil))))))
   (with-redefs [hm/live-agents (constantly [(assoc route :name "A 00f95a") (assoc route :name "B 00f95a")])]
@@ -34,6 +35,11 @@
     (is (= "machine" (first (:machine/relay value))))
     (is (= "00f95a" (second (:machine/relay value))))
     (is (= ["e51411"] (nth (:machine/relay value) 4)))))
+
+(deftest nested-machine-relay-is-rejected-before-send
+  (is (re-find #"Nested Machine\.Relay"
+               (try (hm/send! "00f95a" (pr-str {:machine/relay ["machine" "sender" "heard" "seat" ["00f95a"] "body" ""]}) false nil)
+                    (catch Exception error (.getMessage error))))))
 
 (deftest datalevin-pod-indexes-and-queries-attempts
   (let [root (str (fs/create-temp-dir {:prefix "hm-datalevin-"}))
@@ -141,3 +147,20 @@
     (is (zero? @prompts))
     (is (= "Transported.{ 00f95a working }" (send-result good-agent good-process)))
     (is (= 1 @prompts))))
+
+(deftest listing-joins-live-agents-and-never-reads-ledger-files-as-routes
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-list-"}))
+        second-agent {:session "s" :name "Other 123" :pane_id "x" :terminal_id "u" :agent "codex" :agent_status "idle"}]
+    (binding [hm/*root* root-path]
+      (hm/atomic-edn! (hm/path "00f95a") route)
+      (hm/atomic-edn! (fs/path root-path "attempts.edn") {:not "a route"})
+      (hm/atomic-edn! (fs/path root-path "pending" "not-a-route.edn") {:not "a route"})
+      (with-redefs [hm/live-agents (constantly [(assoc route :agent_status "working") second-agent])]
+        (is (= (str "FLOW\tAGENT\tSESSION\tSTATE\n"
+                    "00f95a\tMind Sol 00f95a\ts\tworking\n"
+                    "-\tOther 123\ts\tidle")
+               (hm/listing!))))
+      (with-redefs [hm/live-agents (constantly [])]
+        (is (= (str "FLOW\tAGENT\tSESSION\tSTATE\n"
+                    "00f95a\tMind Sol 00f95a\ts\tSTALE")
+               (hm/listing!)))))))

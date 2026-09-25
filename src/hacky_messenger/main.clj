@@ -30,7 +30,7 @@
       (binding [*out* *err*]
         (println (if (:hm/parse (ex-data e))
                    (str "usage: " (usage) "hm-clj: error: " (.getMessage e))
-                   (str "hm: " (.getMessage e))))
+                   (str (when-not (:hm/held (ex-data e)) "hm: ") (.getMessage e))))
         (System/exit (if (:hm/parse (ex-data e)) 2 1))))
     (catch Exception e
       (binding [*out* *err*]
