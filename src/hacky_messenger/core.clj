@@ -8,7 +8,7 @@
             [malli.core :as m]))
 
 (def skill-note "Documented by the compensation-hacky-messenger skill (Curriculum skills/compensation-hacky-messenger.md). Update that skill with any change to this tool.")
-(def failure-reasons #{:NotRegistered :InTransition :RouteHold :IdentityChanged :PaneMissing :NotReady :Blocked :ProcessMismatch :Stalled :Uncertain :Submitting :sent})
+(def failure-reasons #{:NotRegistered :InTransition :RouteHold :IdentityChanged :PaneMissing :NotReady :Blocked :ProcessMismatch :Stalled :Uncertain :RelayOverflow :Submitting :sent})
 (def delivery-grades #{:Transported :Presented :Fallback-Presented :Held :Uncertain})
 (def FlowId [:and [:string {:min 1 :max 96}] [:re #"^[A-Za-z0-9][A-Za-z0-9_-]*$"]])
 (def NativeThread [:and [:string {:min 16 :max 96}] [:re #"^[A-Za-z0-9-]+$"]])
@@ -26,7 +26,7 @@
 
 (defn fail [s] (throw (ex-info s {:hm/failure true})))
 (defn valid! [schema value label] (if (m/validate schema value) value (fail (str "Invalid " label ": " (pr-str (m/explain schema value))))))
-(declare atomic-edn! ->EdnLedger record-attempt! record-pending! route-records)
+(declare atomic-edn! ->EdnLedger record-attempt! record-pending! route-records nonempty-strings!)
 (defn flow-id! [value]
   (when-not (and (string? value) (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" value))
     (fail "Flow ID must contain only letters, digits, underscores, or hyphens"))
@@ -63,7 +63,10 @@
 ;; A test seam around the Orchestrate boundary.  Production always uses
 ;; `with-reservation` below; tests supply a short-lived in-memory lease.
 (def ^:dynamic *with-reservation* nil)
-(defn root [] (fs/absolutize (or *root* (System/getenv "HM_REGISTRY") (str (fs/path (System/getProperty "user.home") ".local/state/hacky-messenger")))))
+(defn root []
+  ;; Clojure EDN records must never share Python's JSON registry by default.
+  (fs/absolutize (or *root* (System/getenv "HM_REGISTRY")
+                     (str (fs/path (System/getProperty "user.home") ".local/state/hacky-messenger-clojure")))))
 (defn path [flow] (fs/path (root) (str (flow-id! flow) ".edn")))
 (defn retired-path [flow] (fs/path (root) "retired" (str (flow-id! flow) ".edn")))
 (defn now [] (current-time (->SystemClock)))
@@ -267,6 +270,14 @@
       (when-not (some #(= (first %) (str "attempt/" (:id attempt))) (store/attempts-for (root) flow))
         (fail "Attempt ledger index did not confirm persistence")))
     attempt))
+(defn held-reason [error]
+  (let [message (.getMessage error)
+        candidate (keyword (or message ""))]
+    (if (contains? failure-reasons candidate) candidate :PaneMissing)))
+(defn record-uncertain! [flow route]
+  ;; The pre-prompt record is already durable.  Keep the original uncertainty
+  ;; if storage is unavailable while recording this post-submit observation.
+  (try (append-attempt! flow :Uncertain :Uncertain route) (catch Exception _ nil)))
 (defn reserve! [flow]
   (let [owner (flow-id! (or *flow-id* (System/getenv "FLOW_ID") flow))
         reply (shell {:out :string :err :string :continue true :timeout 15000}
@@ -307,21 +318,29 @@
                     {:hm/failure true :hm/held true}))))
 (defn register! [flow name session native-thread readiness-marker rollout]
   (flow-id! flow) (native-thread! native-thread)
-  (assert-not-retired! flow)
-  (assert-native-not-retired! native-thread flow)
-  (let [agents (:agents (herdr! "--session" session "agent" "list"))
-        found (filter #(= name (:name %)) agents)]
-    (when-not (= 1 (count found)) (fail (str "Expected one live agent named " name "; found " (count found) ". Use --session.")))
-    (let [a (assoc (first found) :session session)
-          proof (when-not (:interactive_ready a)
-                  (if readiness-marker
-                    (readiness-probe! a readiness-marker native-thread rollout)
-                    (fail "Agent is not interactively ready")))
-          route (valid! RouteBinding (cond-> (assoc (select-keys a [:session :name :pane_id :terminal_id :agent]) :native_thread native-thread)
-                                       proof (assoc :readiness_proof proof)) "RouteBinding")]
-      (save-route! (->EdnRegistry (root)) flow route)
-      (store/index-route! (root) flow route)
-      (str "Registered " flow ": " name " (" session ")"))))
+  (nonempty-strings! "Register requires a nonempty agent name and session" [name session])
+  (with-reservation flow
+    (fn []
+      (assert-not-retired! flow)
+      (assert-native-not-retired! native-thread flow)
+      (let [existing (when (fs/exists? (path flow)) (read-route flow))]
+        (when (:route_hold existing) (fail "Registration is held for route repair"))
+        (let [agents (:agents (herdr! "--session" session "agent" "list"))
+              found (filter #(= name (:name %)) agents)]
+          (when-not (= 1 (count found)) (fail (str "Expected one live agent named " name "; found " (count found) ". Use --session.")))
+          (let [a (assoc (first found) :session session)
+                _ (nonempty-strings! "Herdr registration has no agent kind" [(:agent a)])
+                proof (when-not (:interactive_ready a)
+                        (if readiness-marker
+                          (readiness-probe! a readiness-marker native-thread rollout)
+                          (fail "Agent is not interactively ready")))
+                route (valid! RouteBinding (cond-> (assoc (select-keys a [:session :name :pane_id :terminal_id :agent]) :native_thread native-thread)
+                                             proof (assoc :readiness_proof proof)) "RouteBinding")]
+            (when (and existing (not= (:terminal_id existing) (:terminal_id route)))
+              (fail "Flow is already registered to a different terminal"))
+            (save-route! (->EdnRegistry (root)) flow route)
+            (store/index-route! (root) flow route)
+            (str "Registered " flow ": " name " (" session ")")))))))
 (defn nonempty-strings! [label fields]
   (when-not (every? #(and (string? %) (not (str/blank? %))) fields)
     (fail label)))
@@ -377,6 +396,7 @@
       (assert-not-retired! flow)
       (let [actual (read-route flow)
             expected {:session session :name old-name :pane_id pane-id :terminal_id terminal-id :agent agent}]
+        (when (:route_hold actual) (fail "Registration is held for route repair"))
         (when-not (= expected (select-keys actual (keys expected)))
           (fail "Registration differs from the explicitly revalidated old binding"))
         (when-not (= native-thread (:native_thread actual))
@@ -481,10 +501,12 @@
       (fn []
         (assert-not-retired! flow)
         (let [route (read-route flow)
-              live (try (verify-target! route) (catch Exception error (held! flow (keyword (or (.getMessage error) "IdentityChanged")) body route)))
+              _ (when (:route_hold route) (held! flow :RouteHold body route))
+              live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) body route)))
               keys (get abrupt-keys (:agent route))]
           (when-not keys (fail (str "Hard-abrupt is not supported for " (:agent route) "; nothing sent")))
-          (let [envelope (relay sender flow body)
+          (let [envelope (try (relay sender flow body)
+                              (catch Exception _ (held! flow :RelayOverflow body route)))
                 submission (append-attempt! flow :Submitting :Uncertain route)]
             (try
               (doseq [key (:interrupt keys)] (send-keys* (transport) route key))
@@ -494,11 +516,27 @@
               ;; A successful prompt does not prove the terminal stayed bound.
               ;; Recheck before reporting any delivery grade.
               (verify-target! route)
-              (append-attempt! flow :sent (if wait-presented :Presented :Transported) route)
-              (str (if wait-presented "Presented" "Transported") ".{ " flow " " (or (:agent_status live) "unknown") " }")
+              (try
+                (append-attempt! flow :sent (if wait-presented :Presented :Transported) route)
+                (str (if wait-presented "Presented" "Transported") ".{ " flow " " (or (:agent_status live) "unknown") " }")
+                (catch Exception error
+                  (record-uncertain! flow route)
+                  (throw (ex-info (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } prompt was delivered but ledger confirmation failed; do not retry: " (.getMessage error))
+                                  {:hm/failure true :hm/post-ledger true}))))
               (catch Exception error
-                (append-attempt! flow :Uncertain :Uncertain route)
-                (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } Escape was sent; prompt failed or is uncertain: " (.getMessage error)))))))))))
+                (if (:hm/post-ledger (ex-data error))
+                  (throw error)
+                  (do (record-uncertain! flow route)
+                      (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } Escape was sent; prompt failed or is uncertain: " (.getMessage error)))))))))))))
+(defn record-sent! [flow grade route submission live]
+  (try
+    (append-attempt! flow :sent grade route)
+    (str (name grade) ".{ " flow " " (or (:agent_status live) "unknown") " }")
+    (catch Exception error
+      (record-uncertain! flow route)
+      (throw (ex-info (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12)
+                           " } prompt was delivered but ledger confirmation failed; do not retry: " (.getMessage error))
+                      {:hm/failure true :hm/post-ledger true})))))
 (defn send! [flow body wait-presented pane]
   (flow-id! flow) (valid! MessageBody body "MessageBody")
   (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))
@@ -506,26 +544,26 @@
   (let [sender (or *flow-id* (System/getenv "FLOW_ID") (fail "Set FLOW_ID to your own flow ID before sending"))]
     (with-reservation flow
       (fn []
-        ;; The lifecycle check and route resolution share the delivery lease.
         (assert-not-retired! flow)
         (let [stored (try (read-route flow) (catch Exception _ nil))]
+          (when (:route_hold stored) (held! flow :RouteHold body stored))
           (let [[route fallback?] (try (resolve-send-route flow stored pane)
-                                       (catch Exception _
-                                         (held! flow (if stored :PaneMissing :NotRegistered) body stored)))]
-            (let [live (try (verify-target! route)
-                            (catch Exception error
-                              (held! flow (keyword (or (.getMessage error) "IdentityChanged")) body route)))
-                  envelope (relay sender flow body)
-                  submission (append-attempt! flow :Submitting :Uncertain route)]
-              (try
-                (let [wait? (or fallback? wait-presented)
-                      reply (prompt!* (transport) route envelope wait?)]
-                  (when fallback? (presented! reply)))
-                (let [grade (if fallback? :Fallback-Presented (if wait-presented :Presented :Transported))]
-                  (append-attempt! flow :sent grade route)
-                  (str (name grade) ".{ " flow " " (or (:agent_status live) "unknown") " }"))
-                (catch Exception error
-                  (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } prompt failed or is uncertain: " (.getMessage error))))))))))))
+                                       (catch Exception _ (held! flow (if stored :PaneMissing :NotRegistered) body stored)))
+                live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) body route)))
+                envelope (try (relay sender flow body) (catch Exception _ (held! flow :RelayOverflow body route)))
+                submission (append-attempt! flow :Submitting :Uncertain route)
+                grade (if fallback? :Fallback-Presented (if wait-presented :Presented :Transported))]
+            (try
+              (let [reply (prompt!* (transport) route envelope (or fallback? wait-presented))]
+                (when fallback? (presented! reply)))
+              (verify-target! route)
+              (record-sent! flow grade route submission live)
+              (catch Exception error
+                (if (:hm/post-ledger (ex-data error))
+                  (throw error)
+                  (do (record-uncertain! flow route)
+                      (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12)
+                                 " } prompt failed or is uncertain: " (.getMessage error)))))))))))))
 (defn route-records []
   (let [indexed-flows (set (map first (store/routes-for (root))))]
     ;; The EDN binding remains the PoC's readable source record.  Datalevin

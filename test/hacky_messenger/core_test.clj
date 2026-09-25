@@ -208,6 +208,29 @@
     (is (= "Transported.{ 00f95a working }" (send-result good-agent good-process)))
     (is (= 1 @prompts))))
 
+(deftest held-routes-overflow-and-post-prompt-ledger-failure-are-honest
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-p0-"}))
+        prompts (atom 0)
+        good-agent (assoc route :interactive_ready true :agent_status "working")
+        process [{:argv ["codex" "--thread" (:native_thread route)]}]
+        transport (fake-transport good-agent good-agent process prompts)]
+    (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation hm/*transport* transport]
+      (hm/atomic-edn! (hm/path "00f95a") (assoc route :route_hold "pane_move_in_progress"))
+      (is (re-find #"RouteHold" (try (hm/send! "00f95a" "body" false nil) (catch Exception error (.getMessage error)))))
+      (is (re-find #"RouteHold" (try (hm/send-abrupt! "00f95a" "body" false) (catch Exception error (.getMessage error)))))
+      (is (zero? @prompts))
+      (hm/atomic-edn! (hm/path "00f95a") route)
+      (is (re-find #"RelayOverflow" (try (hm/send! "00f95a" (apply str (repeat 790 "x")) false nil) (catch Exception error (.getMessage error)))))
+      (is (pos? (count (fs/glob (fs/path root-path "pending") "*.edn"))))
+      (let [writes (atom 0)
+            ledger (reify hm/Ledger
+                     (record-attempt! [_ _] (if (= 2 (swap! writes inc)) (hm/fail "sent ledger unavailable") :ok))
+                     (record-pending! [_ _ _] :ok))]
+        (binding [hm/*ledger* ledger]
+          (is (re-find #"prompt was delivered but ledger confirmation failed; do not retry"
+                       (try (hm/send! "00f95a" "body" false nil) (catch Exception error (.getMessage error)))))
+          (is (= 1 @prompts)))))))
+
 (deftest listing-joins-live-agents-and-never-reads-ledger-files-as-routes
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-list-"}))
         second-agent {:session "s" :name "Other 123" :pane_id "x" :terminal_id "u" :agent "codex" :agent_status "idle"}]
