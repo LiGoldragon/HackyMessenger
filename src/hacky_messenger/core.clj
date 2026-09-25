@@ -68,7 +68,7 @@
   (let [heard (now)
         seat (or (System/getenv "MESSAGING_SEAT") "unknown")
         positions (valid! MachineRelay ["machine" sender heard seat [recipient] body ""] "Machine.Relay")
-        line (pr-str {:machine/relay positions})]
+        line (binding [*print-namespace-maps* false] (pr-str {:machine/relay positions}))]
     (when (or (str/includes? line "\n") (> (count line) 800))
       (fail "Machine.Relay EDN must be one line of at most 800 characters; message held"))
     (when-not (= {:machine/relay positions} (edn/read-string line))
@@ -326,13 +326,18 @@
                 (catch Exception error
                   (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } prompt failed or is uncertain: " (.getMessage error))))))))))))
 (defn route-records []
-  (into {}
-        (for [p (fs/glob (root) "*.edn")
-              :let [flow (fs/strip-ext (fs/file-name p))]
-              :when (and (string? flow)
-                         (not= "attempts" flow)
-                         (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" flow))]
-          [flow (read-route flow)])))
+  (let [indexed-flows (set (map first (store/routes-for (root))))]
+    ;; The EDN binding remains the PoC's readable source record.  Datalevin
+    ;; names the bindings and delivery history that belong in this view.
+    (doseq [flow indexed-flows] (store/attempts-for (root) flow))
+    (into {}
+          (for [p (fs/glob (root) "*.edn")
+                :let [flow (fs/strip-ext (fs/file-name p))]
+                :when (and (contains? indexed-flows flow)
+                           (string? flow)
+                           (not= "attempts" flow)
+                           (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" flow))]
+            [flow (read-route flow)]))))
 (defn route-matches-agent? [route agent]
   (and (= (:session route) (:session agent))
        (= (:name route) (:name agent))

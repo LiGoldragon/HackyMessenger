@@ -34,6 +34,8 @@
         value (edn/read-string line)]
     (is (<= (count line) 800))
     (is (not (.contains line "\n")))
+    (is (.startsWith line "{:machine/relay"))
+    (is (not (.startsWith line "#:machine")))
     (is (= "machine" (first (:machine/relay value))))
     (is (= "00f95a" (second (:machine/relay value))))
     (is (= ["e51411"] (nth (:machine/relay value) 4)))))
@@ -155,13 +157,19 @@
         second-agent {:session "s" :name "Other 123" :pane_id "x" :terminal_id "u" :agent "codex" :agent_status "idle"}]
     (binding [hm/*root* root-path]
       (hm/atomic-edn! (hm/path "00f95a") route)
+      (store/index-route! root-path "00f95a" route)
       (hm/atomic-edn! (fs/path root-path "attempts.edn") {:not "a route"})
       (hm/atomic-edn! (fs/path root-path "pending" "not-a-route.edn") {:not "a route"})
       (with-redefs [hm/live-agents (constantly [(assoc route :agent_status "working") second-agent])]
         (is (= (str "FLOW\tAGENT\tSESSION\tSTATE\n"
                     "00f95a\tMind Sol 00f95a\ts\tworking\n"
                     "-\tOther 123\ts\tidle")
-               (hm/listing!))))
+               (hm/listing!)))
+        (let [queried (atom [])]
+          (with-redefs [store/routes-for (fn [_] (swap! queried conj :routes) #{["00f95a"]})
+                        store/attempts-for (fn [_ flow] (swap! queried conj [:attempts flow]) #{})]
+            (hm/listing!)
+            (is (= [:routes [:attempts "00f95a"]] @queried)))))
       (with-redefs [hm/live-agents (constantly [])]
         (is (= (str "FLOW\tAGENT\tSESSION\tSTATE\n"
                     "00f95a\tMind Sol 00f95a\ts\tSTALE")

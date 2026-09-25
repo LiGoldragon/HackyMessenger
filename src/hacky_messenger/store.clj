@@ -61,3 +61,11 @@
              [?e :hm/identity ?identity]
              [?e :hm/reason ?reason]]
            (call 'pod.huahaiy.datalevin/db %) flow)))
+
+(defn routes-for [root]
+  (with-connection root
+    #(call 'pod.huahaiy.datalevin/q
+           '[:find ?flow
+             :where [?e :hm/kind :route]
+             [?e :hm/flow ?flow]]
+           (call 'pod.huahaiy.datalevin/db %))))
