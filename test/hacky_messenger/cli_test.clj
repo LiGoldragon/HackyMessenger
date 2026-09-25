@@ -1,6 +1,7 @@
 (ns hacky-messenger.cli-test
   (:require [babashka.fs :as fs]
             [babashka.process :refer [shell]]
+            [clojure.edn :as edn]
             [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [hacky-messenger.core :as hm]
@@ -16,13 +17,16 @@
   (let [root (str (fs/create-temp-dir {:prefix "hm-cli-store-"}))
         tools (fs/create-temp-dir {:prefix "hm-cli-tools-"})
         state (str (fs/path root "fake-herdr-pane"))
+        prompt-log (str (fs/path root "fake-herdr-prompts.edn"))
         evidence (fs/create-temp-file {:prefix "hm-cli-evidence-"})
         herdr (fs/path tools "herdr")
         orchestrate (fs/path tools "orchestrate")
         environment {"PATH" (str tools ":" (System/getenv "PATH"))
                      "HM_REGISTRY" root
+                     "HM_PRIMARY_ROOT" root
                      "FLOW_ID" "sender"
-                     "FAKE_HERDR_STATE" state}]
+                     "FAKE_HERDR_STATE" state
+                     "FAKE_HERDR_PROMPT_LOG" prompt-log}]
     (try
       (fs/copy "test/fake-herdr" herdr)
       (spit (str orchestrate)
@@ -42,6 +46,26 @@
         (is (zero? (:exit sent)) (:err sent))
         (is (str/includes? (:out sent) "Transported.{ 00f95a working }"))
         (is (some #(= :Submitting (:reason %)) (store/attempts-for root "00f95a"))))
+      (let [short-body "one\ntwo\nλ"
+            long-body (apply str (repeat 900 "λ"))
+            short-send (invoke environment "hm-clj-send" "00f95a" short-body)
+            long-send (invoke environment "hm-clj-send" "00f95a" long-body)
+            lines (str/split-lines (slurp prompt-log))
+            values (mapv edn/read-string lines)
+            pointer (nth (:machine/relay (last values)) 5)
+            path (second (re-find #"read (.+) in full\." pointer))]
+        (is (zero? (:exit short-send)) (:err short-send))
+        (is (zero? (:exit long-send)) (:err long-send))
+        (is (= 3 (count lines)))
+        (is (every? #(and (<= (count %) 800) (not (str/includes? % "\n"))) lines))
+        (is (every? #(contains? % :machine/relay) values))
+        (is (= "one two λ" (nth (:machine/relay (second values)) 5)))
+        (is (= (str long-body "\n") (slurp path)))
+        (is (str/starts-with? path (str (fs/path root "flows" "sender" "messages"))))
+        (is (= #{short-body long-body}
+               (set (keep :body (filter #(and (contains? #{:Submitting :sent} (:reason %))
+                                              (not= "isolated-success" (:body %)))
+                                        (store/attempts-for root "00f95a")))))))
       (let [moved (invoke environment "hm-clj-move" "00f95a" "w2"
                           "--session" "s" "--pane-id" "p" "--terminal-id" "t"
                           "--name" "Mind Sol 00f95a" "--agent" "codex"
@@ -49,8 +73,8 @@
         (is (zero? (:exit moved)) (:err moved))
         (is (= "m" (:pane_id (store/route-for root "00f95a")))))
       (let [deregistered (invoke environment "hm-clj-deregister" "00f95a"
-                                  "--session" "s" "--pane-id" "m" "--terminal-id" "t"
-                                  "--name" "Mind Sol 00f95a")]
+                                 "--session" "s" "--pane-id" "m" "--terminal-id" "t"
+                                 "--name" "Mind Sol 00f95a")]
         (is (zero? (:exit deregistered)) (:err deregistered)))
       (let [held (invoke (assoc environment "FAKE_HERDR_AGENT_LIST" "empty")
                          "hm-clj-send" "00f95a" "isolated-held" "--hold-seconds" "0")]

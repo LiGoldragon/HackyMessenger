@@ -69,6 +69,35 @@
     (is (= "00f95a" (second (:machine/relay value))))
     (is (= ["e51411"] (nth (:machine/relay value) 4)))))
 
+(deftest framed-text-is-one-line-edn-and-durably-points-to-overflow
+  (let [primary (str (fs/create-temp-dir {:prefix "hm-primary-"}))
+        fixed-clock (reify hm/Clock (current-time [_] "2026-09-25T00:00:00Z"))]
+    (binding [hm/*clock* fixed-clock]
+      (with-redefs [hm/primary-root (constantly primary)]
+        (let [short-line (hm/framed-text "sender" "00f95a" "one\ntwo\nλ")
+              short-value (edn/read-string short-line)]
+          (is (<= (count short-line) 800))
+          (is (not (str/includes? short-line "\n")))
+          (is (= "one two λ" (nth (:machine/relay short-value) 5))))
+        (let [overhead (dec (count (hm/relay-line "sender" "00f95a" "x")))
+              exact-body (apply str (repeat (- 800 overhead) "x"))
+              exact-line (hm/framed-text "sender" "00f95a" exact-body)]
+          (is (= 800 (count exact-line)))
+          (is (= exact-body (nth (:machine/relay (edn/read-string exact-line)) 5))))
+        (doseq [body [(apply str (repeat 900 "λ"))
+                      "one\ntwo\nthree\nfour"
+                      "literal <pasted_content> wrapper"]]
+          (let [line (hm/framed-text "sender" "00f95a" body)
+                pointer (nth (:machine/relay (edn/read-string line)) 5)
+                path (second (re-find #"read (.+) in full\." pointer))]
+            (is (<= (count line) 800))
+            (is (not (str/includes? line "\n")))
+            (is (not (str/includes? line "<pasted_content")))
+            (is (not (str/starts-with? line "Machine.Relay.{")))
+            (is (str/starts-with? path (str (fs/path primary "flows" "sender" "messages"))))
+            (is (= (if (str/ends-with? body "\n") body (str body "\n"))
+                   (slurp path)))))))))
+
 (deftest nested-machine-relay-is-rejected-before-send
   (is (re-find #"Nested Machine\.Relay"
                (try (hm/send! "00f95a" (pr-str {:machine/relay ["machine" "sender" "heard" "seat" ["00f95a"] "body" ""]}) false nil)
@@ -230,9 +259,11 @@
     (is (= "Transported.{ 00f95a working }" (send-result good-agent good-process)))
     (is (= 1 @prompts))))
 
-(deftest held-routes-overflow-and-post-prompt-ledger-failure-are-honest
+(deftest held-routes-overflow-write-errors-and-post-prompt-ledger-failure-are-honest
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-p0-"}))
+        primary (str (fs/create-temp-dir {:prefix "hm-primary-p0-"}))
         prompts (atom 0)
+        overflow-body (apply str (repeat 790 "x"))
         good-agent (assoc route :interactive_ready true :agent_status "working")
         process [{:argv ["codex" "--thread" (:native_thread route)]}]
         transport (fake-transport good-agent good-agent process prompts)]
@@ -242,8 +273,17 @@
       (is (re-find #"RouteHold" (try (hm/send-abrupt! "00f95a" "body" false) (catch Exception error (.getMessage error)))))
       (is (zero? @prompts))
       (persist-route! root-path route)
-      (is (re-find #"RelayOverflow" (try (hm/send! "00f95a" (apply str (repeat 790 "x")) false nil) (catch Exception error (.getMessage error)))))
-      (is (pos? (count (store/pending-for root-path "00f95a"))))
+      (with-redefs [hm/durable-write! (fn [& _] (hm/fail "disk unavailable"))]
+        (is (re-find #"RelayOverflow" (try (hm/send! "00f95a" overflow-body false nil) (catch Exception error (.getMessage error))))))
+      (let [pending (first (filter #(= overflow-body (:message %))
+                                   (store/pending-for root-path "00f95a")))]
+        (is (= overflow-body (:message pending)))
+        (is (= overflow-body (get-in pending [:attempt :body]))))
+      (with-redefs [hm/primary-root (constantly primary)]
+        (is (= "Transported.{ 00f95a working }" (hm/send! "00f95a" overflow-body false nil))))
+      (is (= #{overflow-body}
+             (set (keep :body (filter #(contains? #{:Submitting :sent} (:reason %))
+                                      (store/attempts-for root-path "00f95a"))))))
       (let [writes (atom 0)
             ledger (reify hm/Ledger
                      (record-attempt! [_ _] (if (= 2 (swap! writes inc)) (hm/fail "sent ledger unavailable") :ok))
@@ -251,7 +291,7 @@
         (binding [hm/*ledger* ledger]
           (is (re-find #"prompt was delivered but ledger confirmation failed; do not retry"
                        (try (hm/send! "00f95a" "body" false nil) (catch Exception error (.getMessage error)))))
-          (is (= 1 @prompts)))))))
+          (is (= 2 @prompts)))))))
 
 (deftest listing-joins-live-agents-from-typed-routes
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-list-"}))

@@ -1,4 +1,8 @@
 (ns hacky-messenger.core
+  (:import [java.nio ByteBuffer]
+           [java.nio.channels FileChannel]
+           [java.nio.file Files OpenOption StandardCopyOption StandardOpenOption]
+           [java.nio.file.attribute PosixFilePermissions])
   (:require [babashka.fs :as fs]
             [cheshire.core :as json]
             [babashka.process :refer [shell]]
@@ -15,7 +19,7 @@
 (def MessageBody [:string {:min 1 :max 65536}])
 (def ReadinessProof [:map {:closed true} [:thread_id NativeThread] [:rollout :string] [:marker :string] [:evidence_kind {:optional true} :string]])
 (def RouteBinding [:map {:closed true} [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string] [:native_thread {:optional true} NativeThread] [:readiness_proof {:optional true} ReadinessProof] [:route_hold {:optional true} :string] [:transition {:optional true} :boolean] [:state {:optional true} :string]])
-(def DeliveryAttempt [:map {:closed true} [:id :string] [:at :string] [:flow FlowId] [:reason :keyword] [:grade {:optional true} :keyword] [:binding {:optional true} RouteBinding]])
+(def DeliveryAttempt [:map {:closed true} [:id :string] [:at :string] [:flow FlowId] [:reason :keyword] [:grade {:optional true} :keyword] [:body {:optional true} MessageBody] [:binding {:optional true} RouteBinding]])
 (def PendingIntent [:map {:closed true} [:attempt DeliveryAttempt] [:message MessageBody] [:state [:= "held"]]])
 (def RouteIdentity [:map {:closed true} [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string]])
 (def RetirementEvidence [:map {:closed true} [:path :string] [:sha256 [:re #"^[0-9a-f]{64}$"]]])
@@ -72,17 +76,72 @@
 (defn registry [] (or *registry* (->DatalevinRegistry (root))))
 (defn now [] (current-time (or *clock* (->SystemClock))))
 (defn quote-datom [s] (str "«" (str/replace (str s) #"[\\»]" {\\ "\\\\" \» "\\»"}) "»"))
-(defn relay [sender recipient body]
+(defn relay-line [sender recipient body]
   ;; Canonical seven positions: ingress, sender, heard, seat, recipients, body, context.
   (let [heard (now)
         seat (or (System/getenv "MESSAGING_SEAT") "unknown")
         positions (valid! MachineRelay ["machine" sender heard seat [recipient] body ""] "Machine.Relay")
         line (binding [*print-namespace-maps* false] (pr-str {:machine/relay positions}))]
-    (when (or (str/includes? line "\n") (> (count line) 800))
-      (fail "Machine.Relay EDN must be one line of at most 800 characters; message held"))
     (when-not (= {:machine/relay positions} (edn/read-string line))
       (fail "Machine.Relay EDN round trip failed; message held"))
     line))
+(defn relay [sender recipient body]
+  (let [line (relay-line sender recipient body)]
+    (when (or (str/includes? line "\n") (> (count line) 800))
+      (fail "Machine.Relay EDN must be one line of at most 800 characters; message held"))
+    line))
+(defn primary-root []
+  (fs/absolutize (or (System/getenv "HM_PRIMARY_ROOT")
+                     (str (fs/path (System/getProperty "user.home") "primary")))))
+(defn- set-posix-permissions! [path permissions]
+  (Files/setPosixFilePermissions (fs/path path) (PosixFilePermissions/fromString permissions)))
+(defn- sync-directory! [directory]
+  (with-open [channel (FileChannel/open (fs/path directory)
+                                        (into-array OpenOption [StandardOpenOption/READ]))]
+    (.force channel true)))
+(defn durable-write! [path content]
+  (let [path (fs/path path)
+        directory (fs/parent path)
+        temporary (fs/path directory (str "." (fs/file-name path) "." (java.util.UUID/randomUUID) ".tmp"))]
+    (fs/create-dirs directory)
+    (set-posix-permissions! directory "rwx------")
+    (try
+      (with-open [channel (FileChannel/open (fs/path temporary)
+                                            (into-array OpenOption
+                                                        [StandardOpenOption/CREATE_NEW
+                                                         StandardOpenOption/WRITE]))]
+        (let [bytes (ByteBuffer/wrap (.getBytes content java.nio.charset.StandardCharsets/UTF_8))]
+          (while (.hasRemaining bytes) (.write channel bytes)))
+        (.force channel true))
+      (set-posix-permissions! temporary "rw-------")
+      (Files/move (fs/path temporary) (fs/path path)
+                  (into-array StandardCopyOption
+                              [StandardCopyOption/ATOMIC_MOVE StandardCopyOption/REPLACE_EXISTING]))
+      (sync-directory! directory)
+      (str (fs/absolutize path))
+      (finally (fs/delete-if-exists temporary)))))
+(defn write-overflow! [sender recipient body]
+  (flow-id! sender)
+  (flow-id! recipient)
+  (let [stamp (str/replace (now) #"[^A-Za-z0-9]+" "-")
+        path (fs/path (primary-root) "flows" sender "messages"
+                      (str stamp "-" recipient "-" (java.util.UUID/randomUUID) ".md"))
+        content (if (str/ends-with? body "\n") body (str body "\n"))]
+    (durable-write! path content)))
+(defn pasted-content-marker? [body]
+  (or (str/includes? body "<pasted_content")
+      (str/includes? body "</pasted_content>")))
+(defn framed-text [sender recipient body]
+  (let [lines (str/split body #"\n" -1)
+        collapsed (str/replace body "\n" " ")
+        direct (relay-line sender recipient collapsed)]
+    (if (and (<= (count lines) 3)
+             (<= (count direct) 800)
+             (not (pasted-content-marker? body)))
+      (relay sender recipient collapsed)
+      (let [path (write-overflow! sender recipient body)
+            pointer (str "Message too long for a pane; read " path " in full.")]
+        (relay sender recipient pointer)))))
 (defn nested-relay? [body]
   (or (str/includes? body "Machine.Relay.{")
       (try
@@ -274,8 +333,9 @@
     :else [(fallback-route flow nil nil) true]))
 (defn in-transition? [route] (or (:transition route) (= "transition" (:state route))))
 (defn needs-binding? [route] (= "NeedsBinding" (:state route)))
-(defn append-attempt! [flow reason grade route]
+(defn append-attempt! [flow reason grade route body]
   (let [attempt (cond-> {:id (str (java.util.UUID/randomUUID)) :at (now) :flow flow :reason reason :grade grade}
+                  body (assoc :body body)
                   route (assoc :binding route))]
     (delivery-attempt! attempt)
     (record-attempt! (or *ledger* (->DatalevinLedger (root))) attempt)
@@ -289,10 +349,10 @@
   (let [message (.getMessage error)
         candidate (keyword (or message ""))]
     (if (contains? failure-reasons candidate) candidate :PaneMissing)))
-(defn record-uncertain! [flow route]
+(defn record-uncertain! [flow route body]
   ;; The pre-prompt record is already durable.  Keep the original uncertainty
   ;; if storage is unavailable while recording this post-submit observation.
-  (try (append-attempt! flow :Uncertain :Uncertain route) (catch Exception _ nil)))
+  (try (append-attempt! flow :Uncertain :Uncertain route body) (catch Exception _ nil)))
 (defn reserve! [flow]
   (let [owner (flow-id! (or *flow-id* (System/getenv "FLOW_ID") flow))
         reply (shell {:out :string :err :string :continue true :timeout 15000}
@@ -322,7 +382,7 @@
                                 "PendingIntent"))
     attempt))
 (defn held! [flow reason body route]
-  (let [attempt (append-attempt! flow reason :Held route)
+  (let [attempt (append-attempt! flow reason :Held route body)
         pending (valid! PendingIntent {:attempt attempt :message body :state "held"} "PendingIntent")]
     (record-pending! (or *ledger* (->DatalevinLedger (root))) attempt body)
     (when-not *ledger*
@@ -529,9 +589,9 @@
           (let [live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) body route)))
                 keys (get abrupt-keys (:agent route))]
             (when-not keys (fail (str "Hard-abrupt is not supported for " (:agent route) "; nothing sent")))
-            (let [envelope (try (relay sender flow body)
+            (let [envelope (try (framed-text sender flow body)
                                 (catch Exception _ (held! flow :RelayOverflow body route)))
-                  submission (append-attempt! flow :Submitting :Uncertain route)]
+                  submission (append-attempt! flow :Submitting :Uncertain route body)]
               (try
                 (doseq [key (:interrupt keys)] (send-keys* (transport) route key))
                 (let [reply (prompt!* (transport) route envelope wait-presented)]
@@ -541,23 +601,23 @@
               ;; Recheck before reporting any delivery grade.
                 (verify-target! route)
                 (try
-                  (append-attempt! flow :sent (if wait-presented :Presented :Transported) route)
+                  (append-attempt! flow :sent (if wait-presented :Presented :Transported) route body)
                   (str (if wait-presented "Presented" "Transported") ".{ " flow " " (or (:agent_status live) "unknown") " }")
                   (catch Exception error
-                    (record-uncertain! flow route)
+                    (record-uncertain! flow route body)
                     (throw (ex-info (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } prompt was delivered but ledger confirmation failed; do not retry: " (.getMessage error))
                                     {:hm/failure true :hm/post-ledger true}))))
                 (catch Exception error
                   (if (:hm/post-ledger (ex-data error))
                     (throw error)
-                    (do (record-uncertain! flow route)
+                    (do (record-uncertain! flow route body)
                         (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } Escape was sent; prompt failed or is uncertain: " (.getMessage error))))))))))))))
-(defn record-sent! [flow grade route submission live]
+(defn record-sent! [flow grade route submission live body]
   (try
-    (append-attempt! flow :sent grade route)
+    (append-attempt! flow :sent grade route body)
     (str (name grade) ".{ " flow " " (or (:agent_status live) "unknown") " }")
     (catch Exception error
-      (record-uncertain! flow route)
+      (record-uncertain! flow route body)
       (throw (ex-info (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12)
                            " } prompt was delivered but ledger confirmation failed; do not retry: " (.getMessage error))
                       {:hm/failure true :hm/post-ledger true})))))
@@ -582,18 +642,18 @@
            (let [[route fallback?] (try (resolve-send-route flow stored pane)
                                         (catch Exception _ (held! flow (if stored :PaneMissing :NotRegistered) body stored)))
                  live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) body route)))
-                 envelope (try (relay sender flow body) (catch Exception _ (held! flow :RelayOverflow body route)))
-                 submission (append-attempt! flow :Submitting :Uncertain route)
+                 envelope (try (framed-text sender flow body) (catch Exception _ (held! flow :RelayOverflow body route)))
+                 submission (append-attempt! flow :Submitting :Uncertain route body)
                  grade (if fallback? :Fallback-Presented (if wait-presented :Presented :Transported))]
              (try
                (let [reply (prompt!* (transport) route envelope (or fallback? wait-presented))]
                  (when fallback? (presented! reply)))
                (verify-target! route)
-               (record-sent! flow grade route submission live)
+               (record-sent! flow grade route submission live body)
                (catch Exception error
                  (if (:hm/post-ledger (ex-data error))
                    (throw error)
-                   (do (record-uncertain! flow route)
+                   (do (record-uncertain! flow route body)
                        (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12)
                                   " } prompt failed or is uncertain: " (.getMessage error))))))))))))))
 (defn route-records []
