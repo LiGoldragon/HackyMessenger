@@ -1,10 +1,18 @@
 (ns hacky-messenger.typed-store
   "Experimental, unused typed Datalevin authority API. Core commands remain on
   EDN until their readers and writers switch together in a later cutover."
-  (:require [malli.core :as m]))
+  (:require [malli.core :as m]
+            [babashka.fs :as fs]
+            [babashka.pods :as pods]))
+
+(pods/load-pod 'huahaiy/datalevin "0.8.25")
+(require 'pod.huahaiy.datalevin)
+(def pod-version "0.8.25")
+(defn- call [symbol & args] (apply (resolve symbol) args))
 
 (def schema
   {:flow/id {:db/unique :db.unique/identity}
+   :attempt/id {:db/unique :db.unique/identity} :pending/id {:db/unique :db.unique/identity}
    :route/flow {:db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
    :attempt/flow {:db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
    :pending/attempt {:db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
@@ -37,3 +45,25 @@
   (let [retirement (retirement! retirement)] [(assoc (dissoc retirement :retirement/flow) :retirement/flow [:flow/id (:retirement/flow retirement)])]))
 (defn export-edn [entities] (pr-str entities))
 (defn import-edn [value] (when-not (sequential? value) (throw (ex-info "Typed import must be sequential EDN" {}))) value)
+(defn database-path [root] (str (fs/path root "typed-datalevin")))
+(defn with-db [root f]
+  (let [conn (call 'pod.huahaiy.datalevin/get-conn (database-path root) schema)]
+    (try (f conn) (finally (call 'pod.huahaiy.datalevin/close conn)))))
+(defn transact! [root tx] (with-db root #(call 'pod.huahaiy.datalevin/transact! % tx)))
+(defn put-route! [root route] (transact! root (route-tx route)) route)
+(defn put-attempt! [root attempt] (transact! root (attempt-tx attempt)) attempt)
+(defn put-pending! [root attempt-id state]
+  (transact! root [{:pending/id attempt-id :pending/attempt [:attempt/id attempt-id] :pending/state state}]))
+(defn put-retirement! [root retirement] (transact! root (retirement-tx retirement)) retirement)
+(defn query [root form & inputs]
+  (with-db root #(apply call 'pod.huahaiy.datalevin/q form (call 'pod.huahaiy.datalevin/db %) inputs)))
+(defn route-for [root flow]
+  (let [rows (query root '[:find ?session ?pane ?terminal ?agent ?thread ?hold ?state
+                           :in $ ?flow
+                           :where [?f :flow/id ?flow] [?r :route/flow ?f] [?r :route/session ?session]
+                           [?r :route/pane ?pane] [?r :route/terminal ?terminal] [?r :route/agent ?agent]
+                           [?r :route/thread ?thread] [?r :route/hold ?hold] [?r :route/state ?state]] flow)]
+    (when (> (count rows) 1) (throw (ex-info "Typed route is not unique" {:flow flow})))
+    (when-let [[session pane terminal agent thread hold state] (first rows)]
+      (route! {:flow/id flow :route/session session :route/pane pane :route/terminal terminal :route/agent agent
+               :route/thread thread :route/hold hold :route/state state}))))
