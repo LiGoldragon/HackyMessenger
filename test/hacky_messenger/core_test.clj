@@ -1,6 +1,8 @@
 (ns hacky-messenger.core-test
   (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is]]
+            [cheshire.core :as json]
             [malli.core]
             [hacky-messenger.core :as hm]
             [hacky-messenger.store :as store]
@@ -164,3 +166,47 @@
         (is (= (str "FLOW\tAGENT\tSESSION\tSTATE\n"
                     "00f95a\tMind Sol 00f95a\ts\tSTALE")
                (hm/listing!)))))))
+
+(deftest readiness-probe-requires-exact-native-turns
+  (let [marker "HM_READY_12345678"
+        transcript (fs/create-temp-file {:prefix "hm-rollout-" :suffix ".jsonl"})
+        prompts (atom 0)
+        agent (assoc route :interactive_ready false)
+        transport (reify hm/HerdrTransport
+                    (live-agents* [_] [agent])
+                    (target-agent* [_ _] {:agent agent})
+                    (process-info* [_ _] {:process_info {:foreground_processes []}})
+                    (prompt!* [_ _ _ _] (swap! prompts inc) {:ok true}))
+        user {:type "event_msg" :payload {:thread_id (:native_thread route)
+                                          :item {:type "UserMessage" :content [{:text (str "Reply " marker)}]}}}
+        reply {:type "event_msg" :payload {:thread_id (:native_thread route)
+                                           :item {:type "AgentMessage" :content [{:text marker}]}}}]
+    (spit (str transcript) (str (json/generate-string user) "\n" (json/generate-string reply) "\n"))
+    (binding [hm/*transport* transport hm/*readiness-attempts* 1]
+      (is (= {:thread_id (:native_thread route) :rollout (str (fs/absolutize transcript)) :marker marker}
+             (hm/readiness-probe! agent marker (:native_thread route) transcript)))
+      (is (= 1 @prompts))
+      (is (thrown? Exception (hm/readiness-probe! agent "not-a-marker" (:native_thread route) transcript)))
+      (spit (str transcript) (str (json/generate-string {:type "user" :sessionId (:native_thread route) :message {:content marker}}) "\n"
+                                  (json/generate-string {:type "assistant" :sessionId (:native_thread route) :message {:content marker}}) "\n"))
+      (is (= "claude-transcript" (:evidence_kind (hm/readiness-probe! agent marker (:native_thread route) transcript))))
+      (spit (str transcript) (str (json/generate-string (assoc-in reply [:payload :thread_id] "different")) "\n"))
+      (is (thrown? Exception (hm/readiness-probe! agent marker (:native_thread route) transcript))))))
+
+(deftest register-persists-proof-for-a-not-ready-agent
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-register-proof-"}))
+        marker "HM_READY_87654321"
+        transcript (fs/create-temp-file {:prefix "hm-register-rollout-" :suffix ".jsonl"})
+        agent (assoc route :interactive_ready false)
+        rows [{:type "event_msg" :payload {:thread_id (:native_thread route)
+                                           :item {:type "UserMessage" :content [{:text marker}]}}}
+              {:type "event_msg" :payload {:thread_id (:native_thread route)
+                                           :item {:type "AgentMessage" :content [{:text marker}]}}}]]
+    (spit (str transcript) (str/join "\n" (map json/generate-string rows)))
+    (binding [hm/*root* root-path hm/*readiness-attempts* 1]
+      (with-redefs [hm/herdr! (fn [& args]
+                                (if (some #{"list"} args) {:agents [agent]} {:ok true}))]
+        (is (thrown? Exception (hm/register! "00f95a" (:name route) "s" (:native_thread route) nil nil)))
+        (is (= "Registered 00f95a: Mind Sol 00f95a (s)"
+               (hm/register! "00f95a" (:name route) "s" (:native_thread route) marker transcript)))
+        (is (= marker (get-in (hm/read-route "00f95a") [:readiness_proof :marker])))))))

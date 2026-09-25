@@ -54,6 +54,7 @@
 (def ^:dynamic *flow-id* nil)
 (def ^:dynamic *ledger* nil)
 (def ^:dynamic *transport* nil)
+(def ^:dynamic *readiness-attempts* 50)
 ;; A test seam around the Orchestrate boundary.  Production always uses
 ;; `with-reservation` below; tests supply a short-lived in-memory lease.
 (def ^:dynamic *with-reservation* nil)
@@ -125,6 +126,63 @@
         native (native-thread! (:native_thread route))]
     (when-not (some #(str/includes? (str/join " " (map str (or (:argv %) []))) native) processes)
       (fail "ProcessMismatch"))))
+(defn content-text [content]
+  (cond
+    (string? content) content
+    (sequential? content) (str/join "" (keep #(when (map? %) (:text %)) content))
+    :else ""))
+(defn readiness-witness [rows marker native-thread rollout]
+  (let [user-index (first (keep-indexed (fn [index row]
+                                          (let [payload (:payload row) item (:item payload)]
+                                            (when (and (= "event_msg" (:type row))
+                                                       (= native-thread (:thread_id payload))
+                                                       (= "UserMessage" (:type item))
+                                                       (str/includes? (content-text (:content item)) marker))
+                                              index))) rows))]
+    (when user-index
+      (some (fn [row]
+              (let [payload (:payload row) item (:item payload)]
+                (when (and (= native-thread (:thread_id payload))
+                           (= "AgentMessage" (:type item))
+                           (= marker (str/trim (content-text (:content item)))))
+                  {:thread_id native-thread :rollout (str (fs/absolutize rollout)) :marker marker})))
+            (drop (inc user-index) rows)))))
+(defn claude-readiness-witness [rows marker native-thread rollout]
+  (let [session-id #(or (:sessionId %) (:session_id %))
+        user-index (first (keep-indexed (fn [index row]
+                                          (when (and (= "user" (:type row))
+                                                     (= native-thread (session-id row))
+                                                     (str/includes? (content-text (get-in row [:message :content])) marker))
+                                            index)) rows))]
+    (when user-index
+      (some (fn [row]
+              (when (and (= "assistant" (:type row))
+                         (= native-thread (session-id row))
+                         (= marker (str/trim (content-text (get-in row [:message :content])))))
+                {:thread_id native-thread :rollout (str (fs/absolutize rollout)) :marker marker
+                 :evidence_kind "claude-transcript"}))
+            (drop (inc user-index) rows)))))
+(defn readiness-probe! [agent marker native-thread rollout]
+  (when-not (and (string? marker) (re-matches #"HM_READY_[A-Za-z0-9_-]{8,96}" marker))
+    (fail "Readiness probe marker must be a unique HM_READY token"))
+  (native-thread! native-thread)
+  (try
+    (prompt!* (transport) agent (str "Reply exactly " marker " to confirm this explicit HM readiness probe.") false)
+    (catch Exception error
+      ;; Herdr can report this after injecting into a resumed Codex pane.  Only
+      ;; the exact native transcript witness below can turn it into readiness.
+      (when-not (str/includes? (or (.getMessage error) "") "agent_prompt_stalled")
+        (throw error))))
+  (when-not rollout (fail "Readiness probe requires a native Codex rollout or Claude transcript"))
+  (loop [remaining *readiness-attempts*]
+    (let [rows (try (mapv #(json/parse-string % true)
+                          (remove str/blank? (str/split-lines (slurp (str rollout)))))
+                    (catch Exception _ (fail "Readiness probe rollout is unavailable or invalid")))]
+      (or (readiness-witness rows marker native-thread rollout)
+          (claude-readiness-witness rows marker native-thread rollout)
+          (if (pos? (dec remaining))
+            (do (Thread/sleep 100) (recur (dec remaining)))
+            (fail "Readiness probe marker was not observed in an exact native assistant reply"))))))
 (defn verify-target! [route]
   (let [reply (target-agent* (transport) route)
         agent (or (:agent reply) reply)]
@@ -225,12 +283,18 @@
         (fail "Pending ledger index did not confirm persistence")))
     (throw (ex-info (str "Held.{ " flow " " (name reason) " attempt-" (subs (:id attempt) 0 12) " }")
                     {:hm/failure true :hm/held true}))))
-(defn register! [flow name session native-thread]
+(defn register! [flow name session native-thread readiness-marker rollout]
   (flow-id! flow) (native-thread! native-thread)
   (let [agents (:agents (herdr! "--session" session "agent" "list"))
         found (filter #(= name (:name %)) agents)]
     (when-not (= 1 (count found)) (fail (str "Expected one live agent named " name "; found " (count found) ". Use --session.")))
-    (let [a (first found) route (valid! RouteBinding (assoc (select-keys a [:session :name :pane_id :terminal_id :agent]) :session session :native_thread native-thread) "RouteBinding")]
+    (let [a (assoc (first found) :session session)
+          proof (when-not (:interactive_ready a)
+                  (if readiness-marker
+                    (readiness-probe! a readiness-marker native-thread rollout)
+                    (fail "Agent is not interactively ready")))
+          route (valid! RouteBinding (cond-> (assoc (select-keys a [:session :name :pane_id :terminal_id :agent]) :native_thread native-thread)
+                                       proof (assoc :readiness_proof proof)) "RouteBinding")]
       (save-route! (->EdnRegistry (root)) flow route)
       (store/index-route! (root) flow route)
       (str "Registered " flow ": " name " (" session ")"))))

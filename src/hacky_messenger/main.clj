@@ -19,11 +19,12 @@
                      (when-not (try (<= 0 (Double/parseDouble hold) 60) (catch Exception _ false))
                        (hm/fail "--hold-seconds must be between 0 and 60")))
                    (println (hm/send! flow body (boolean (some #{"--wait-presented"} rest)) (arg rest "--pane"))))
-          "register" (let [[flow name & rest] xs session (arg rest "--session") thread (arg rest "--native-thread")]
+          "register" (let [[flow name & rest] xs session (arg rest "--session") thread (arg rest "--native-thread")
+                           marker (arg rest "--readiness-probe") rollout (arg rest "--rollout")]
                        (when-not (and flow name) (parse-error "the following arguments are required: flow, name"))
                        (unknown-flags! rest #{"--session" "--native-thread" "--readiness-probe" "--rollout"})
                        (when-not (and session thread) (hm/fail "register requires --session and --native-thread in the Clojure proof"))
-                       (println (hm/register! flow name session thread)))
+                       (println (hm/register! flow name session thread marker rollout)))
           "list" (println (hm/listing!))
           (parse-error (str "invalid choice: " op)))))
     (catch clojure.lang.ExceptionInfo e
