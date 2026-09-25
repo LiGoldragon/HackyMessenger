@@ -40,17 +40,17 @@
                    (when-not (and flow body) (parse-error "the following arguments are required: flow, message"))
                    (unknown-flags! rest #{"--wait-presented" "--hold-seconds" "--pane"})
                    (extra-values! rest #{"--wait-presented" "--hold-seconds" "--pane"})
-                   (let [hold (or (arg rest "--hold-seconds") "10")]
-                     (when-not (try (<= 0 (Double/parseDouble hold) 60) (catch Exception _ false))
-                       (parse-error "argument --hold-seconds: invalid float value")))
-                   (println (hm/send! flow body (boolean (some #{"--wait-presented"} rest)) (arg rest "--pane"))))
+                   (let [hold (try (Double/parseDouble (or (arg rest "--hold-seconds") "10"))
+                                   (catch Exception _ (parse-error "argument --hold-seconds: invalid float value")))]
+                     (when-not (<= 0 hold 60) (hm/fail "--hold-seconds must be between 0 and 60"))
+                     (println (hm/send! flow body (boolean (some #{"--wait-presented"} rest)) (arg rest "--pane") hold))))
           "send-abrupt" (let [[flow body & rest] xs]
                           (when-not (and flow body) (parse-error "the following arguments are required: flow, message"))
                           (unknown-flags! rest #{"--wait-presented" "--hold-seconds"})
                           (extra-values! rest #{"--wait-presented" "--hold-seconds"})
-                          (let [hold (or (arg rest "--hold-seconds") "10")]
-                            (when-not (try (<= 0 (Double/parseDouble hold) 60) (catch Exception _ false))
-                              (parse-error "argument --hold-seconds: invalid float value")))
+                          (let [hold (try (Double/parseDouble (or (arg rest "--hold-seconds") "10"))
+                                          (catch Exception _ (parse-error "argument --hold-seconds: invalid float value")))]
+                            (when-not (<= 0 hold 60) (hm/fail "--hold-seconds must be between 0 and 60")))
                           (println (hm/send-abrupt! flow body (boolean (some #{"--wait-presented"} rest)))))
           "register" (let [[flow name & rest] xs session (arg rest "--session") thread (arg rest "--native-thread")
                            marker (arg rest "--readiness-probe") rollout (arg rest "--rollout")]

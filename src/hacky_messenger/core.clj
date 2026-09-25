@@ -558,34 +558,40 @@
       (throw (ex-info (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12)
                            " } prompt was delivered but ledger confirmation failed; do not retry: " (.getMessage error))
                       {:hm/failure true :hm/post-ledger true})))))
-(defn send! [flow body wait-presented pane]
-  (flow-id! flow) (valid! MessageBody body "MessageBody")
-  (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))
-  (when (nested-relay? body) (fail "Nested Machine.Relay is not a message body"))
-  (let [sender (or *flow-id* (System/getenv "FLOW_ID") (fail "Set FLOW_ID to your own flow ID before sending"))]
-    (with-reservation flow
-      (fn []
-        (assert-not-retired! flow)
-        (let [stored (try (read-route flow) (catch Exception _ nil))]
-          (when (in-transition? stored) (held! flow :InTransition body stored))
-          (when (:route_hold stored) (held! flow :RouteHold body stored))
-          (let [[route fallback?] (try (resolve-send-route flow stored pane)
-                                       (catch Exception _ (held! flow (if stored :PaneMissing :NotRegistered) body stored)))
-                live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) body route)))
-                envelope (try (relay sender flow body) (catch Exception _ (held! flow :RelayOverflow body route)))
-                submission (append-attempt! flow :Submitting :Uncertain route)
-                grade (if fallback? :Fallback-Presented (if wait-presented :Presented :Transported))]
-            (try
-              (let [reply (prompt!* (transport) route envelope (or fallback? wait-presented))]
-                (when fallback? (presented! reply)))
-              (verify-target! route)
-              (record-sent! flow grade route submission live)
-              (catch Exception error
-                (if (:hm/post-ledger (ex-data error))
-                  (throw error)
-                  (do (record-uncertain! flow route)
-                      (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12)
-                                 " } prompt failed or is uncertain: " (.getMessage error)))))))))))))
+(defn send!
+  ([flow body wait-presented pane] (send! flow body wait-presented pane 10))
+  ([flow body wait-presented pane hold-seconds]
+   (flow-id! flow) (valid! MessageBody body "MessageBody")
+   (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))
+   (when (nested-relay? body) (fail "Nested Machine.Relay is not a message body"))
+   (let [sender (or *flow-id* (System/getenv "FLOW_ID") (fail "Set FLOW_ID to your own flow ID before sending"))]
+     (with-reservation flow
+       (fn []
+         (assert-not-retired! flow)
+         (let [stored (try (read-route flow) (catch Exception _ nil))
+               stored (if (and (nil? stored) (pos? hold-seconds))
+                        (do (Thread/sleep (long (* 1000 hold-seconds)))
+                            (try (read-route flow) (catch Exception _ nil)))
+                        stored)]
+           (when (in-transition? stored) (held! flow :InTransition body stored))
+           (when (:route_hold stored) (held! flow :RouteHold body stored))
+           (let [[route fallback?] (try (resolve-send-route flow stored pane)
+                                        (catch Exception _ (held! flow (if stored :PaneMissing :NotRegistered) body stored)))
+                 live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) body route)))
+                 envelope (try (relay sender flow body) (catch Exception _ (held! flow :RelayOverflow body route)))
+                 submission (append-attempt! flow :Submitting :Uncertain route)
+                 grade (if fallback? :Fallback-Presented (if wait-presented :Presented :Transported))]
+             (try
+               (let [reply (prompt!* (transport) route envelope (or fallback? wait-presented))]
+                 (when fallback? (presented! reply)))
+               (verify-target! route)
+               (record-sent! flow grade route submission live)
+               (catch Exception error
+                 (if (:hm/post-ledger (ex-data error))
+                   (throw error)
+                   (do (record-uncertain! flow route)
+                       (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12)
+                                  " } prompt failed or is uncertain: " (.getMessage error))))))))))))))
 (defn route-records []
   (let [indexed-flows (set (map first (store/routes-for (root))))]
     ;; The EDN binding remains the PoC's readable source record.  Datalevin
