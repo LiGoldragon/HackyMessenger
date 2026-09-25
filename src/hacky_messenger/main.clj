@@ -9,7 +9,7 @@
 (defn -main [& argv]
   (try
     (let [[op & xs] argv]
-      (if (or (nil? op) (= op "--help") (= op "-h") (some #{"--help" "-h"} xs))
+      (if (or (= op "--help") (= op "-h") (some #{"--help" "-h"} xs))
         (println (usage))
         (case op
           "send" (let [[flow body & rest] xs]
@@ -17,14 +17,14 @@
                    (unknown-flags! rest #{"--wait-presented" "--hold-seconds" "--pane"})
                    (let [hold (or (arg rest "--hold-seconds") "10")]
                      (when-not (try (<= 0 (Double/parseDouble hold) 60) (catch Exception _ false))
-                       (hm/fail "--hold-seconds must be between 0 and 60")))
+                       (parse-error "argument --hold-seconds: invalid float value")))
                    (println (hm/send! flow body (boolean (some #{"--wait-presented"} rest)) (arg rest "--pane"))))
           "send-abrupt" (let [[flow body & rest] xs]
                           (when-not (and flow body) (parse-error "the following arguments are required: flow, message"))
                           (unknown-flags! rest #{"--wait-presented" "--hold-seconds"})
                           (let [hold (or (arg rest "--hold-seconds") "10")]
                             (when-not (try (<= 0 (Double/parseDouble hold) 60) (catch Exception _ false))
-                              (hm/fail "--hold-seconds must be between 0 and 60")))
+                              (parse-error "argument --hold-seconds: invalid float value")))
                           (println (hm/send-abrupt! flow body (boolean (some #{"--wait-presented"} rest)))))
           "register" (let [[flow name & rest] xs session (arg rest "--session") thread (arg rest "--native-thread")
                            marker (arg rest "--readiness-probe") rollout (arg rest "--rollout")]
@@ -54,7 +54,8 @@
                          name (arg rest "--name") agent (arg rest "--agent") native-thread (arg rest "--native-thread") pid-text (arg rest "--process-pid")]
                      (when-not (every? some? [session pane-id terminal-id name agent native-thread pid-text])
                        (parse-error "the following arguments are required: --session, --pane-id, --terminal-id, --name, --agent, --native-thread, --process-pid"))
-                     (let [pid (try (parse-long pid-text) (catch Exception _ (parse-error "argument --process-pid: invalid int value")))]
+                     (let [pid (or (try (parse-long pid-text) (catch Exception _ nil))
+                                   (parse-error "argument --process-pid: invalid int value"))]
                        (println (hm/move! flow session pane-id terminal-id name agent native-thread pid workspace)))))
           ("retire" "import-retirement") (let [[flow & rest] xs]
                                            (when-not flow (parse-error "the following arguments are required: flow"))
@@ -64,7 +65,7 @@
                                              (when-not (every? some? [session pane-id terminal-id name agent native-thread evidence digest])
                                                (parse-error "the following arguments are required: --session, --pane-id, --terminal-id, --name, --agent, --native-thread, --evidence, --evidence-sha256"))
                                              (println (hm/retire! flow session pane-id terminal-id name agent native-thread evidence digest (= op "import-retirement")))))
-          "list" (println (hm/listing!))
+          "list" (do (when (seq xs) (parse-error "unrecognized arguments")) (println (hm/listing!)))
           (parse-error (str "invalid choice: " op)))))
     (catch clojure.lang.ExceptionInfo e
       (binding [*out* *err*]

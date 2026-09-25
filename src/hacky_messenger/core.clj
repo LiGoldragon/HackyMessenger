@@ -58,6 +58,8 @@
 (def ^:dynamic *root* nil)
 (def ^:dynamic *flow-id* nil)
 (def ^:dynamic *ledger* nil)
+(def ^:dynamic *registry* nil)
+(def ^:dynamic *clock* nil)
 (def ^:dynamic *transport* nil)
 (def ^:dynamic *readiness-attempts* 50)
 ;; A test seam around the Orchestrate boundary.  Production always uses
@@ -69,7 +71,8 @@
                      (str (fs/path (System/getProperty "user.home") ".local/state/hacky-messenger-clojure")))))
 (defn path [flow] (fs/path (root) (str (flow-id! flow) ".edn")))
 (defn retired-path [flow] (fs/path (root) "retired" (str (flow-id! flow) ".edn")))
-(defn now [] (current-time (->SystemClock)))
+(defn registry [] (or *registry* (->EdnRegistry (root))))
+(defn now [] (current-time (or *clock* (->SystemClock))))
 (defn quote-datom [s] (str "«" (str/replace (str s) #"[\\»]" {\\ "\\\\" \» "\\»"}) "»"))
 (defn relay [sender recipient body]
   ;; Canonical seven positions: ingress, sender, heard, seat, recipients, body, context.
@@ -97,7 +100,7 @@
 (defn read-route [flow]
   (let [p (path flow)]
     (when-not (fs/exists? p) (fail (str "No valid registration for " flow)))
-    (try (route-binding! (load-route (->EdnRegistry (root)) flow))
+    (try (route-binding! (load-route (registry) flow))
          (catch Exception e (fail (str "No valid registration for " flow ": " (.getMessage e)))))))
 (defn herdr! [& args]
   (let [{:keys [exit out err]} (apply shell {:out :string :err :string :continue true :timeout 15000} "herdr" args)]
@@ -351,7 +354,7 @@
                                              proof (assoc :readiness_proof proof)) "RouteBinding")]
             (when (and existing (not= (:terminal_id existing) (:terminal_id route)))
               (fail "Flow is already registered to a different terminal"))
-            (save-route! (->EdnRegistry (root)) flow route)
+            (save-route! (registry) flow route)
             (store/index-route! (root) flow route)
             (str "Registered " flow ": " name " (" session ")")))))))
 (defn nonempty-strings! [label fields]
