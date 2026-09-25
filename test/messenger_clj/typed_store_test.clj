@@ -57,15 +57,22 @@
 (deftest real-pod-roundtrips-psyche-variant-and-exact-submission
   (with-temp-store
     (fn [root]
-      (let [submitted "#psyche [\"sender\" \"context\" \"verbatim λ\"]"
+      (let [submitted "#psyche [\"sender\" \"context\" \"1/2\" \"verbatim λ \"]"
             psyche (assoc attempt :id "attempt-psyche" :variant :psyche
-                          :context "context" :body "verbatim λ" :submitted submitted)
-            pending {:attempt psyche :message "verbatim λ" :variant :psyche
-                     :context "context" :state "held"}]
+                          :context "context" :body "verbatim λ "
+                          :part_index 1 :part_count 2 :submitted submitted)
+            second-submitted "#psyche [\"sender\" nil \"2/2\" \"rest\"]"
+            second (assoc attempt :id "attempt-psyche-2" :variant :psyche
+                          :context nil :body "rest" :part_index 2 :part_count 2
+                          :submitted second-submitted)
+            pending {:attempt second :message "rest" :variant :psyche
+                     :context nil :part_index 2 :part_count 2 :state "held"}]
         (typed/put-attempt! root psyche)
+        (typed/put-attempt! root second)
         (typed/put-pending! root pending)
         (is (= psyche (typed/attempt-by-id root "attempt-psyche")))
-        (is (= pending (typed/pending-by-id root "attempt-psyche")))))))
+        (is (= second (typed/attempt-by-id root "attempt-psyche-2")))
+        (is (= pending (typed/pending-by-id root "attempt-psyche-2")))))))
 
 (deftest retirement-preserves-evidence-and-wins-over-a-route
   (with-temp-store

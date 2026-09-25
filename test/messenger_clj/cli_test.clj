@@ -115,7 +115,7 @@
             long-body (str "line 1\n" (apply str (repeat 12000 "λ🙂"))
                            "\n<pasted_content id=\"abc\">whole</pasted_content>")
             context "context first\nwith UTF-8: 世界"
-            verbatim (str "  verbatim starts\n" (apply str (repeat 5000 "ψ")) "\nverbatim ends  ")
+            verbatim (str "  verbatim starts\n" (str/join " " (repeat 5000 "ψ")) "\nverbatim ends  ")
             short-send (invoke environment "hm-send" "00f95a" short-body)
             long-send (invoke environment "hm-send" "00f95a" long-body)
             psyche-send (invoke environment "hm-send" "00f95a" "--psyche" context verbatim)
@@ -125,23 +125,29 @@
         (is (zero? (:exit short-send)) (:err short-send))
         (is (zero? (:exit long-send)) (:err long-send))
         (is (zero? (:exit psyche-send)) (:err psyche-send))
-        (is (= 4 (count lines)))
+        (is (> (count lines) 4))
         (is (> (count (nth lines 2)) 800))
-        (is (> (count (nth lines 3)) 800))
+        (is (every? #(<= (count %) 800) (drop 3 lines)))
         (is (= ["sender" short-body] (second values)))
         (is (= ["sender" long-body] (nth values 2)))
-        (is (= ["sender" context verbatim] (nth values 3)))
+        (is (= verbatim (apply str (map #(nth % 3) (drop 3 values)))))
+        (is (= context (second (nth values 3))))
+        (is (every? nil? (map second (drop 4 values))))
         (is (not-any? #(str/includes? % "Message too long for a pane") lines))
-        (is (= #{short-body long-body verbatim}
+        (is (= #{short-body long-body}
                (set (keep :body (filter #(and (contains? #{:Submitting :sent} (:reason %))
+                                              (= :msg (:variant %))
                                               (not= "isolated-success" (:body %)))
                                         attempts)))))
         (let [psyche-attempts (filter #(= :psyche (:variant %)) attempts)
-              expected (hm/message-envelope "sender" {:variant :psyche :context context :body verbatim})]
-          (is (= 2 (count psyche-attempts)))
-          (is (every? #(= context (:context %)) psyche-attempts))
-          (is (every? #(= verbatim (:body %)) psyche-attempts))
-          (is (every? #(= expected (:submitted %)) psyche-attempts))))
+              sent-parts (sort-by :part_index (filter #(= :sent (:reason %)) psyche-attempts))
+              part-count (:part_count (first sent-parts))]
+          (is (= (* 2 part-count) (count psyche-attempts)))
+          (is (= verbatim (apply str (map :body sent-parts))))
+          (is (= context (:context (first sent-parts))))
+          (is (every? nil? (map :context (rest sent-parts))))
+          (is (= (range 1 (inc part-count)) (map :part_index sent-parts)))
+          (is (every? #(<= (count (:submitted %)) 800) psyche-attempts))))
       (let [moved (invoke environment "hm-move" "00f95a" "w2"
                           "--session" "s" "--pane-id" "p" "--terminal-id" "t"
                           "--name" "Mind Sol 00f95a" "--agent" "codex"

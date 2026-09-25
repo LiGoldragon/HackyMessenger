@@ -17,15 +17,15 @@
 (def MessageVariant [:enum :msg :psyche])
 (def ReadinessProof [:map {:closed true} [:thread_id NativeThread] [:rollout :string] [:marker :string] [:evidence_kind {:optional true} :string]])
 (def RouteBinding [:map {:closed true} [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string] [:native_thread {:optional true} NativeThread] [:readiness_proof {:optional true} ReadinessProof] [:route_hold {:optional true} :string] [:transition {:optional true} :boolean] [:state {:optional true} :string]])
-(def DeliveryAttempt [:map {:closed true} [:id :string] [:at :string] [:flow FlowId] [:reason :keyword] [:grade {:optional true} :keyword] [:variant {:optional true} MessageVariant] [:context {:optional true} MessageBody] [:body {:optional true} MessageBody] [:submitted {:optional true} :string] [:binding {:optional true} RouteBinding]])
-(def PendingIntent [:map {:closed true} [:attempt DeliveryAttempt] [:message MessageBody] [:variant {:optional true} MessageVariant] [:context {:optional true} MessageBody] [:state [:= "held"]]])
+(def DeliveryAttempt [:map {:closed true} [:id :string] [:at :string] [:flow FlowId] [:reason :keyword] [:grade {:optional true} :keyword] [:variant {:optional true} MessageVariant] [:context {:optional true} [:maybe MessageBody]] [:body {:optional true} MessageBody] [:part_index {:optional true} pos-int?] [:part_count {:optional true} pos-int?] [:submitted {:optional true} :string] [:binding {:optional true} RouteBinding]])
+(def PendingIntent [:map {:closed true} [:attempt DeliveryAttempt] [:message MessageBody] [:variant {:optional true} MessageVariant] [:context {:optional true} [:maybe MessageBody]] [:part_index {:optional true} pos-int?] [:part_count {:optional true} pos-int?] [:state [:= "held"]]])
 (def RouteIdentity [:map {:closed true} [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string]])
 (def RetirementEvidence [:map {:closed true} [:path :string] [:sha256 [:re #"^[0-9a-f]{64}$"]]])
 (def RetirementMarker [:map {:closed true} [:version [:= 1]] [:state [:= "retired"]] [:flow FlowId] [:record RouteIdentity] [:native_thread NativeThread] [:evidence RetirementEvidence] [:retired_by :string] [:retired_at :string]])
 (def Reservation [:map {:closed true} [:id :int] [:flow FlowId] [:root :string]])
 (def PaneMessage [:tuple FlowId MessageBody])
-(def PsycheMessage [:tuple FlowId MessageBody MessageBody])
-(def MessageRequest [:map {:closed true} [:variant MessageVariant] [:body MessageBody] [:context {:optional true} MessageBody]])
+(def PsycheMessage [:tuple FlowId [:maybe MessageBody] [:and :string [:re #"^[1-9][0-9]*/[1-9][0-9]*$"]] MessageBody])
+(def MessageRequest [:map {:closed true} [:variant MessageVariant] [:body MessageBody] [:context {:optional true} [:maybe MessageBody]] [:part_index {:optional true} pos-int?] [:part_count {:optional true} pos-int?]])
 (doseq [schema [FlowId NativeThread MessageBody MessageVariant ReadinessProof RouteBinding DeliveryAttempt PendingIntent RetirementMarker Reservation PaneMessage PsycheMessage MessageRequest]] (m/validator schema))
 
 (defn fail [s] (throw (ex-info s {:hm/failure true})))
@@ -85,7 +85,11 @@
   ;; tagged value is deliberately just the two pane-visible fields.
   (valid! PaneMessage value "#msg"))
 (defn read-psyche [value]
-  (valid! PsycheMessage value "#psyche"))
+  (let [[_ _ label :as message] (valid! PsycheMessage value "#psyche")
+        [_ index total] (re-matches #"([1-9][0-9]*)/([1-9][0-9]*)" label)]
+    (when (> (parse-long index) (parse-long total))
+      (fail "#psyche part index exceeds its count"))
+    message))
 (defn- read-complete [readers line]
   (with-open [reader (PushbackReader. (StringReader. line))]
     (let [eof (Object.)
@@ -104,21 +108,76 @@
     (or (get value tagged) (fail "Expected one complete #psyche form"))))
 (defn request! [request]
   (let [request (valid! MessageRequest request "MessageRequest")]
+    (when (not= (contains? request :part_index) (contains? request :part_count))
+      (fail "Message part metadata must be complete"))
+    (when (and (:part_index request) (> (:part_index request) (:part_count request)))
+      (fail "Message part index exceeds its count"))
     (when (and (= :psyche (:variant request)) (not (contains? request :context)))
       (fail "Psyche messages require context"))
     (when (and (= :msg (:variant request)) (contains? request :context))
       (fail "Machine messages do not carry psyche context"))
+    (when (and (= :msg (:variant request)) (:part_index request))
+      (fail "Machine messages do not carry part metadata"))
+    (when (and (= :psyche (:variant request)) (:part_index request)
+               (not= (nil? (:context request)) (> (:part_index request) 1)))
+      (fail "Only the first psyche part carries context"))
     request))
 (defn message-envelope [sender request]
   (flow-id! sender)
-  (let [{:keys [variant context body]} (request! request)
+  (let [{:keys [variant context body part_index part_count]} (request! request)
         [tag value reader] (case variant
                              :msg ["#msg" (read-msg [sender body]) read-pane-message]
-                             :psyche ["#psyche" (read-psyche [sender context body]) read-psyche-message])
+                             :psyche (do
+                                       (when-not part_index
+                                         (fail "Psyche envelope requires numbered part metadata"))
+                                       ["#psyche" (read-psyche [sender context (str part_index "/" part_count) body]) read-psyche-message]))
         envelope (str tag " " (pr-str value))]
     (when-not (= value (reader envelope))
       (fail (str tag " EDN round trip failed; message held")))
     envelope))
+
+(def max-psyche-envelope-characters 800)
+(defn psyche-envelope [sender context index total piece]
+  (message-envelope sender {:variant :psyche :context context :body piece
+                            :part_index index :part_count total}))
+(defn- provisional-psyche-envelope [sender context index total piece]
+  ;; Packing must measure labels before the final part count is known. The
+  ;; provisional numerator may temporarily exceed the denominator.
+  (str "#psyche " (pr-str [sender context (str index "/" total) piece])))
+(defn- psyche-tokens [verbatim]
+  ;; Whitespace itself is a safe boundary and may be packed one code point at
+  ;; a time. Non-whitespace runs are indivisible words.
+  (vec (re-seq #"\s|\S+" verbatim)))
+(defn- pack-psyche-with-total [sender context verbatim total]
+  (let [tokens (psyche-tokens verbatim)]
+    (loop [remaining tokens index 1 parts []]
+      (if (empty? remaining)
+        parts
+        (let [part-context (when (= index 1) context)
+              [piece rest-tokens]
+              (loop [accepted [] candidates remaining]
+                (if-let [token (first candidates)]
+                  (let [candidate (apply str (conj accepted token))]
+                    (if (<= (count (provisional-psyche-envelope sender part-context index total candidate))
+                            max-psyche-envelope-characters)
+                      (recur (conj accepted token) (next candidates))
+                      [(apply str accepted) candidates]))
+                  [(apply str accepted) []]))]
+          (when (empty? piece)
+            (fail "Psyche context or one verbatim token cannot fit in an 800-character envelope; message held"))
+          (recur (vec rest-tokens) (inc index) (conj parts piece)))))))
+(defn psyche-requests [sender context verbatim]
+  (loop [total 1 seen #{}]
+    (when (contains? seen total)
+      (fail "Psyche part labels did not stabilize; message held"))
+    (let [pieces (pack-psyche-with-total sender context verbatim total)
+          actual (count pieces)]
+      (if (= total actual)
+        (mapv (fn [index piece]
+                {:variant :psyche :context (when (= index 1) context) :body piece
+                 :part_index index :part_count actual})
+              (range 1 (inc actual)) pieces)
+        (recur actual (conj seen total))))))
 (defn relay-line [sender _recipient body] (message-envelope sender {:variant :msg :body body}))
 (defn relay [sender recipient body] (relay-line sender recipient body))
 (defn framed-text [sender _recipient body] (message-envelope sender {:variant :msg :body body}))
@@ -310,7 +369,7 @@
 (defn in-transition? [route] (or (:transition route) (= "transition" (:state route))))
 (defn needs-binding? [route] (= "NeedsBinding" (:state route)))
 (defn attempt-fields [request submitted]
-  (cond-> (select-keys (request! request) [:variant :context :body])
+  (cond-> (select-keys (request! request) [:variant :context :body :part_index :part_count])
     submitted (assoc :submitted submitted)))
 (defn append-attempt! [flow reason grade route request submitted]
   (let [attempt (cond-> {:id (str (java.util.UUID/randomUUID)) :at (now) :flow flow :reason reason :grade grade}
@@ -376,19 +435,21 @@
     (store/put-attempt! state-root attempt)
     attempt)
   (record-pending! [_ attempt request]
-    (let [{:keys [variant context body]} (request! request)]
+    (let [{:keys [variant context body part_index part_count]} (request! request)]
       (store/put-pending! state-root
                           (valid! PendingIntent
                                   (cond-> {:attempt attempt :message body :variant variant :state "held"}
-                                    context (assoc :context context))
+                                    (contains? request :context) (assoc :context context)
+                                    part_index (assoc :part_index part_index :part_count part_count))
                                   "PendingIntent")))
     attempt))
 (defn held! [flow reason request route]
-  (let [{:keys [variant context body]} (request! request)
+  (let [{:keys [variant context body part_index part_count]} (request! request)
         attempt (append-attempt! flow reason :Held route request nil)
         pending (valid! PendingIntent
                         (cond-> {:attempt attempt :message body :variant variant :state "held"}
-                          context (assoc :context context))
+                          (contains? request :context) (assoc :context context)
+                          part_index (assoc :part_index part_index :part_count part_count))
                         "PendingIntent")]
     (record-pending! (or *ledger* (->DatalevinLedger (root))) attempt request)
     (when-not *ledger*
@@ -582,7 +643,7 @@
                   "claude" {:interrupt ["esc" "esc"] :submit ["enter"]}})
 (defn validate-request! [request]
   (let [{:keys [context body] :as request} (request! request)
-        values (cond-> [body] context (conj context))]
+        values (cond-> [body] (some? context) (conj context))]
     (when (some #(or (str/blank? %) (re-find #"[\p{Cc}&&[^\n\t]]" %)) values)
       (fail "Message fields must be nonempty and contain no terminal control characters"))
     (when (some nested-relay? values)
@@ -627,7 +688,20 @@
 (defn send-abrupt! [flow body wait-presented]
   (send-abrupt-request! flow {:variant :msg :body body} wait-presented))
 (defn send-abrupt-psyche! [flow context verbatim wait-presented]
-  (send-abrupt-request! flow {:variant :psyche :context context :body verbatim} wait-presented))
+  (flow-id! flow)
+  (let [request (validate-request! {:variant :psyche :context context :body verbatim})
+        sender (or *flow-id* (System/getenv "FLOW_ID")
+                   (fail "Set FLOW_ID to your own flow ID before sending"))]
+    (with-reservation flow
+      (fn []
+        (let [requests (try
+                         (psyche-requests sender context verbatim)
+                         (catch Exception error
+                           (if (:hm/failure (ex-data error))
+                             (held! flow :RelayOverflow request nil)
+                             (throw error))))]
+          (binding [*with-reservation* (fn [_ f] (f))]
+            (last (mapv #(send-abrupt-request! flow % wait-presented) requests))))))))
 (defn record-sent! [flow grade route submission live request envelope]
   (try
     (append-attempt! flow :sent grade route request envelope)
@@ -678,9 +752,22 @@
    (send-request! flow {:variant :msg :body body} wait-presented pane hold-seconds)))
 (defn send-psyche!
   ([flow context verbatim wait-presented pane]
-   (send-request! flow {:variant :psyche :context context :body verbatim} wait-presented pane))
+   (send-psyche! flow context verbatim wait-presented pane 10))
   ([flow context verbatim wait-presented pane hold-seconds]
-   (send-request! flow {:variant :psyche :context context :body verbatim} wait-presented pane hold-seconds)))
+   (flow-id! flow)
+   (let [request (validate-request! {:variant :psyche :context context :body verbatim})
+         sender (or *flow-id* (System/getenv "FLOW_ID")
+                    (fail "Set FLOW_ID to your own flow ID before sending"))]
+     (with-reservation flow
+       (fn []
+         (let [requests (try
+                          (psyche-requests sender context verbatim)
+                          (catch Exception error
+                            (if (:hm/failure (ex-data error))
+                              (held! flow :RelayOverflow request nil)
+                              (throw error))))]
+           (binding [*with-reservation* (fn [_ f] (f))]
+             (last (mapv #(send-request! flow % wait-presented pane hold-seconds) requests)))))))))
 (defn route-records []
   (into {} (remove (fn [[flow _]] (store/retirement-for (root) flow))
                    (store/routes (root)))))

@@ -2,7 +2,7 @@
 
 `messenger-clj` is the standalone Clojure command line messenger for live Flow
 routes in Herdr. It resolves a Flow ID to its registered pane, checks the route
-and native harness identity, and prompts that pane exactly once.
+and native harness identity, and submits each durable envelope once.
 
 The public compatibility commands remain available:
 
@@ -32,15 +32,21 @@ retirements stay in the typed ledger.
 Living words use a separate variant:
 
 ```clojure
-#psyche ["FLOW_ID" "context first" "verbatim words"]
+#psyche ["FLOW_ID" "context first" "1/2" "first verbatim piece "]
+#psyche ["FLOW_ID" nil             "2/2" "second verbatim piece"]
 ```
 
-Context always precedes the verbatim field. The verbatim field is serialized
-exactly, including newlines and Unicode; it is never summarized or truncated.
-Both variants may exceed Claude's paste threshold. Messenger sends the whole
-tagged envelope into the pane and accepts Claude's `pasted_content` wrapper.
-The ledger records the variant, the exact input fields, and the exact envelope
-submitted to Herdr.
+Each complete `#psyche` envelope is at most 800 characters. Messenger packs the
+verbatim input at word or whitespace boundaries, recomputes the pieces until
+the `i/n` labels stabilize, and submits them sequentially. Context appears only
+on the first piece. Concatenating the piece fields reproduces the verbatim
+input exactly, including whitespace, newlines, and Unicode. A context or word
+that cannot fit is held durably before any prompt. If one prompt is uncertain,
+later pieces are not attempted.
+
+`#msg` has no 800-character limit and continues to carry one whole machine
+message. The ledger records the variant, part numbers, exact input fields, and
+exact envelope for every submission attempt.
 
 Pass only the body to `hm-send` or `messenger-clj send`. A field that parses as
 one complete `#msg` or `#psyche` form is rejected. Ordinary prose may mention
