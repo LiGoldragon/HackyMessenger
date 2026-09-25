@@ -66,14 +66,23 @@ The `hm-*` scripts are development compatibility launchers. JSON migration is
 available only through `messenger-clj import-json`; it is not an operational
 authority or fallback.
 
-The Nix package installs the compiled Babashka uberscript, a pinned Datalevin
-pod, `messenger-clj`, and the nine `hm-*` command links:
+The Nix package is built with [clj-build](https://github.com/LiGoldragon/clj-build).
+`bb.edn` doubles as the `deps.edn` that clj-build resolves once in a
+fixed-output derivation; everything after that runs offline. The package holds a
+Babashka uberjar built from `src/` in Nix, the pinned Datalevin pod 0.8.25,
+`messenger-clj`, and the nine `hm-*` command links. No build product is
+committed: the uberjar exists only as the output of the current source. The
+build lives in `nix/`; `flake.nix` only indexes it.
 
 ```sh
 nix build
 nix run . -- --help
 nix flake check
 ```
+
+`nix flake check` builds the package, runs it against an empty typed ledger
+(`check.nix`), and runs the Clojure test suite below as the `clj-tests` check,
+with the pinned pod and a stub `orchestrate`.
 
 The managed Home activation exposes that package through
 `~/.local/libexec/messenger-clj`; the old
@@ -101,5 +110,7 @@ bb --config bb.edn -e \
   '(require '\''messenger-clj.core-test '\''messenger-clj.cli-test '\''messenger-clj.typed-store-test '\''messenger-clj.legacy-import-test) (apply clojure.test/run-tests ['\''messenger-clj.core-test '\''messenger-clj.cli-test '\''messenger-clj.typed-store-test '\''messenger-clj.legacy-import-test])'
 ```
 
-The suite uses fake Herdr boundaries and temporary Datalevin stores. It never
-sends to a live route.
+Set `MESSENGER_CLJ_DATALEVIN_POD` to a Datalevin 0.8.25 `dtlv` to use the
+pinned pod instead of fetching it. The suite uses fake Herdr boundaries and
+temporary Datalevin stores. It never sends to a live route, but one core test
+takes a Lock through the `orchestrate` on `PATH`.

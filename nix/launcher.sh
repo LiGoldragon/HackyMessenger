@@ -17,4 +17,4 @@ case "$(basename "$0")" in
 esac
 
 exec "@babashka@/bin/bb" --config "@out@/share/messenger-clj/bb.edn" \
-  "@out@/share/messenger-clj/messenger-clj.clj" "$@"
+  "@out@/share/messenger-clj/messenger-clj.jar" "$@"

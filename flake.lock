@@ -1,5 +1,25 @@
 {
   "nodes": {
+    "clj-build": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1790372915,
+        "narHash": "sha256-5r/NvchgUrsMidcZpAEZ3cabwc7iIALwPn9q5Uv3S00=",
+        "owner": "LiGoldragon",
+        "repo": "clj-build",
+        "rev": "01126ad41b8f06ebd1469db30e89efc7dc74b649",
+        "type": "github"
+      },
+      "original": {
+        "owner": "LiGoldragon",
+        "repo": "clj-build",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1790185690,
@@ -18,6 +38,7 @@
     },
     "root": {
       "inputs": {
+        "clj-build": "clj-build",
         "nixpkgs": "nixpkgs"
       }
     }
