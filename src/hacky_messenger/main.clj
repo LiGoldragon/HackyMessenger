@@ -56,10 +56,12 @@
                            marker (arg rest "--readiness-probe") rollout (arg rest "--rollout")]
                        (when-not (and flow name) (parse-error "the following arguments are required: flow, name"))
                        (unknown-flags! rest #{"--session" "--native-thread" "--readiness-probe" "--rollout"})
+                       (extra-values! rest #{"--session" "--native-thread" "--readiness-probe" "--rollout"})
                        (println (hm/register! flow name session thread marker rollout)))
           "deregister" (let [[flow & rest] xs]
                          (when-not flow (parse-error "the following arguments are required: flow"))
                          (unknown-flags! rest #{"--session" "--pane-id" "--terminal-id" "--name"})
+                         (extra-values! rest #{"--session" "--pane-id" "--terminal-id" "--name"})
                          (let [session (arg rest "--session") pane-id (arg rest "--pane-id") terminal-id (arg rest "--terminal-id") name (arg rest "--name")]
                            (when-not (every? some? [session pane-id terminal-id name])
                              (parse-error "the following arguments are required: --session, --pane-id, --terminal-id, --name"))
@@ -67,6 +69,7 @@
           "rebind" (let [[flow new-name & rest] xs]
                      (when-not (and flow new-name) (parse-error "the following arguments are required: flow, new_name"))
                      (unknown-flags! rest #{"--old-name" "--session" "--pane-id" "--terminal-id" "--agent" "--native-thread"})
+                     (extra-values! rest #{"--old-name" "--session" "--pane-id" "--terminal-id" "--agent" "--native-thread"})
                      (let [old-name (arg rest "--old-name") session (arg rest "--session") pane-id (arg rest "--pane-id")
                            terminal-id (arg rest "--terminal-id") agent (arg rest "--agent") native-thread (arg rest "--native-thread")]
                        (when-not (every? some? [old-name session pane-id terminal-id agent native-thread])
@@ -75,6 +78,7 @@
           "move" (let [[flow workspace & rest] xs]
                    (when-not (and flow workspace) (parse-error "the following arguments are required: flow, workspace"))
                    (unknown-flags! rest #{"--session" "--pane-id" "--terminal-id" "--name" "--agent" "--native-thread" "--process-pid"})
+                   (extra-values! rest #{"--session" "--pane-id" "--terminal-id" "--name" "--agent" "--native-thread" "--process-pid"})
                    (let [session (arg rest "--session") pane-id (arg rest "--pane-id") terminal-id (arg rest "--terminal-id")
                          name (arg rest "--name") agent (arg rest "--agent") native-thread (arg rest "--native-thread") pid-text (arg rest "--process-pid")]
                      (when-not (every? some? [session pane-id terminal-id name agent native-thread pid-text])
@@ -85,6 +89,7 @@
           ("retire" "import-retirement") (let [[flow & rest] xs]
                                            (when-not flow (parse-error "the following arguments are required: flow"))
                                            (unknown-flags! rest #{"--session" "--pane-id" "--terminal-id" "--name" "--agent" "--native-thread" "--evidence" "--evidence-sha256"})
+                                           (extra-values! rest #{"--session" "--pane-id" "--terminal-id" "--name" "--agent" "--native-thread" "--evidence" "--evidence-sha256"})
                                            (let [session (arg rest "--session") pane-id (arg rest "--pane-id") terminal-id (arg rest "--terminal-id") name (arg rest "--name")
                                                  agent (arg rest "--agent") native-thread (arg rest "--native-thread") evidence (arg rest "--evidence") digest (arg rest "--evidence-sha256")]
                                              (when-not (every? some? [session pane-id terminal-id name agent native-thread evidence digest])
