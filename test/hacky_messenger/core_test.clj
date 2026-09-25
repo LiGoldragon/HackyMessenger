@@ -17,7 +17,30 @@
     (live-agents* [_] [live-agent])
     (target-agent* [_ _] {:agent target-agent})
     (process-info* [_ _] {:process_info {:foreground_processes processes}})
+    (pane* [_ route] {:pane (select-keys route [:pane_id :terminal_id :agent])})
+    (move-pane* [_ route _ _] {:move_result {:previous_pane_id (:pane_id route) :previous_workspace_id "w1"
+                                             :pane (assoc (select-keys route [:terminal_id :agent]) :pane_id "moved" :workspace_id "w2")}})
     (prompt!* [_ _ _ _] (swap! prompts inc) {:ok true})))
+
+(defn move-transport [route mode moves]
+  (reify hm/HerdrTransport
+    (live-agents* [_]
+      (let [pane @moves]
+        (if (or (and (= mode :ambiguous) (not= pane "p"))
+                (and (= mode :compensate) (= pane "m")))
+          []
+          [(assoc route :pane_id pane)])))
+    (target-agent* [_ route] {:agent route})
+    (process-info* [_ _] {:process_info {:foreground_processes [{:pid 123 :argv ["codex" "--thread" (:native_thread route)]}]}})
+    (pane* [_ requested] {:pane {:pane_id (:pane_id requested) :terminal_id (:terminal_id route) :agent (:agent route)
+                                 :workspace_id (if (= "p" (:pane_id requested)) "w1" (if (= "m" (:pane_id requested)) "w2" "w1"))}})
+    (move-pane* [_ requested workspace _]
+      (let [next-pane (if (= "p" (:pane_id requested)) "m" "r")
+            previous-workspace (if (= "p" (:pane_id requested)) "w1" "w2")]
+        (reset! moves next-pane)
+        {:move_result {:previous_pane_id (:pane_id requested) :previous_workspace_id previous-workspace
+                       :pane {:pane_id next-pane :terminal_id (:terminal_id route) :agent (:agent route) :workspace_id workspace}}}))
+    (prompt!* [_ _ _ _] {:ok true})))
 
 (deftest identifiers-and-title-fallback-are-strict
   (is (false? (malli.core/validate hm/FlowId "../../etc/x")))
@@ -184,6 +207,8 @@
                     (live-agents* [_] [agent])
                     (target-agent* [_ _] {:agent agent})
                     (process-info* [_ _] {:process_info {:foreground_processes []}})
+                    (pane* [_ _] {:pane {}})
+                    (move-pane* [_ _ _ _] {:move_result {}})
                     (prompt!* [_ _ _ _] (swap! prompts inc) {:ok true}))
         user {:type "event_msg" :payload {:thread_id (:native_thread route)
                                           :item {:type "UserMessage" :content [{:text (str "Reply " marker)}]}}}
@@ -238,3 +263,32 @@
         (is (= "Mind Sol renamed" (:name (hm/read-route "00f95a"))))
         (is (thrown? Exception
                      (hm/rebind! "00f95a" "Mind Sol renamed" "again" "s" "p" "t" "codex" "different-native-thread")))))))
+
+(deftest guarded-move-persists-hold-before-mutation-and-compensates
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-move-"}))
+        invoke (fn [mode]
+                 (let [moves (atom "p")]
+                   (binding [hm/*root* root-path hm/*with-reservation* pass-reservation
+                             hm/*transport* (move-transport route mode moves)]
+                     (hm/atomic-edn! (hm/path "00f95a") route)
+                     (store/index-route! root-path "00f95a" route)
+                     [(try (hm/move! "00f95a" "s" "p" "t" "Mind Sol 00f95a" "codex" (:native_thread route) 123 "w2")
+                           (catch Exception error (.getMessage error)))
+                      (hm/read-route "00f95a")])))]
+    (let [[result record] (invoke :success)]
+      (is (= "Moved 00f95a: w1/p -> w2/m (t)" result))
+      (is (= "m" (:pane_id record)))
+      (is (nil? (:route_hold record))))
+    (let [[result record] (invoke :compensate)]
+      (is (re-find #"returned to original workspace" result))
+      (is (= "r" (:pane_id record)))
+      (is (nil? (:route_hold record))))
+    (let [[result record] (invoke :ambiguous)]
+      (is (re-find #"delivery held for manual route repair" result))
+      (is (= "pane_move_in_progress" (:route_hold record))))
+    (let [moves (atom "p")]
+      (binding [hm/*root* root-path hm/*with-reservation* pass-reservation
+                hm/*transport* (move-transport route :success moves)]
+        (hm/atomic-edn! (hm/path "00f95a") (assoc route :route_hold "pane_move_in_progress"))
+        (is (thrown? Exception (hm/move! "00f95a" "s" "p" "t" "Mind Sol 00f95a" "codex" (:native_thread route) 123 "w2")))
+        (is (= "p" @moves))))))

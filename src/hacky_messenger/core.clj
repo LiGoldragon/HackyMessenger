@@ -42,6 +42,8 @@
   (live-agents* [this])
   (target-agent* [this route])
   (process-info* [this route])
+  (pane* [this route])
+  (move-pane* [this route workspace label])
   (prompt!* [this route envelope wait?]))
 (defprotocol Ledger (record-attempt! [this attempt]) (record-pending! [this attempt body]))
 (defprotocol Clock (current-time [this]))
@@ -110,6 +112,8 @@
   (live-agents* [_] (shell-live-agents))
   (target-agent* [_ route] (herdr! "--session" (:session route) "agent" "get" (:pane_id route)))
   (process-info* [_ route] (herdr! "--session" (:session route) "pane" "process-info" "--pane" (:pane_id route)))
+  (pane* [_ route] (herdr! "--session" (:session route) "pane" "get" (:pane_id route)))
+  (move-pane* [_ route workspace label] (herdr! "--session" (:session route) "pane" "move" (:pane_id route) "--new-tab" "--workspace" workspace "--label" label "--no-focus"))
   (prompt!* [_ route envelope wait?] (direct-prompt! route envelope wait?)))
 (defn transport [] (or *transport* (->ShellHerdr)))
 (defn assert-not-retired! [flow]
@@ -338,6 +342,83 @@
           (atomic-edn! (path flow) replacement)
           (store/index-route! (root) flow replacement)
           (str "Rebound " flow ": " old-name " -> " new-name " (" session "/" pane-id "/" terminal-id ")"))))))
+(defn move-route! [flow record pane-id hold?]
+  (let [replacement (cond-> (assoc record :pane_id pane-id)
+                      hold? (assoc :route_hold "pane_move_in_progress")
+                      (not hold?) (dissoc :route_hold))]
+    (atomic-edn! (path flow) replacement)
+    (store/index-route! (root) flow replacement)
+    replacement))
+(defn pane-value [reply] (or (:pane reply) reply))
+(defn move-result-value [reply] (or (:move_result reply) reply))
+(defn verify-move-target! [expected pane process-pid native-thread]
+  (let [route (assoc expected :pane_id (:pane_id pane))
+        live-pane (pane-value (pane* (transport) route))
+        info (or (:process_info (process-info* (transport) route)) (process-info* (transport) route))
+        processes (:foreground_processes info)
+        matches (filter #(and (= (:session expected) (:session %))
+                              (= (:name expected) (:name %))
+                              (= (:pane_id route) (:pane_id %))
+                              (= (:terminal_id expected) (:terminal_id %))
+                              (= (:agent expected) (:agent %)))
+                        (live-agents))]
+    (when-not (and (= (:terminal_id expected) (:terminal_id pane))
+                   (= (:terminal_id expected) (:terminal_id live-pane))
+                   (= (:agent expected) (:agent live-pane)))
+      (fail "Moved pane terminal or harness identity changed"))
+    (when-not (some #(= process-pid (:pid %)) processes)
+      (fail "Moved pane foreground process identity changed"))
+    (when-not (some #(str/includes? (str/join " " (map str (or (:argv %) []))) native-thread) processes)
+      (fail "Moved pane native session identity changed"))
+    (when-not (= 1 (count matches))
+      (fail "Moved pane has no unique matching Herdr agent"))
+    route))
+(defn move! [flow session pane-id terminal-id name agent native-thread process-pid workspace]
+  (flow-id! flow)
+  (nonempty-strings! "Move requires the complete old route" [session pane-id terminal-id name agent])
+  (native-thread! native-thread)
+  (when-not (and (integer? process-pid) (pos? process-pid))
+    (fail "Move requires a witnessed positive foreground process PID"))
+  (when-not (and (string? workspace) (re-matches #"w[A-Za-z0-9]+" workspace))
+    (fail "Move requires an exact Herdr workspace ID"))
+  (with-reservation flow
+    (fn []
+      (assert-not-retired! flow)
+      (let [record (read-route flow)
+            expected {:session session :name name :pane_id pane-id :terminal_id terminal-id :agent agent}]
+        (when (:route_hold record) (fail "Registration is held for route repair; move refused"))
+        (when-not (and (= expected (select-keys record (keys expected))) (= native-thread (:native_thread record)))
+          (fail "Move old route or native thread differs from registration"))
+        (let [source (pane-value (pane* (transport) record))
+              old-workspace (:workspace_id source)]
+          (verify-move-target! expected source process-pid native-thread)
+          (when (some #(and (not= flow (key %)) (= terminal-id (get-in % [1 :terminal_id]))) (route-records))
+            (fail "Terminal is registered to another Flow"))
+          ;; The persisted hold is the boundary before an irreversible pane mutation.
+          (move-route! flow record pane-id true)
+          (let [moved (atom nil)]
+            (try
+              (let [result (move-result-value (move-pane* (transport) record workspace (or (:label source) name)))
+                    pane (:pane result)]
+                (reset! moved pane)
+                (when-not (and (= pane-id (:previous_pane_id result))
+                               (= old-workspace (:previous_workspace_id result))
+                               (= workspace (:workspace_id pane)))
+                  (fail "Herdr move result differs from requested route"))
+                (let [verified (verify-move-target! expected pane process-pid native-thread)]
+                  (move-route! flow record (:pane_id verified) false)
+                  (str "Moved " flow ": " old-workspace "/" pane-id " -> " workspace "/" (:pane_id verified) " (" terminal-id ")")))
+              (catch Exception error
+                (if-not @moved
+                  (fail (str "Move failed or is uncertain; inspect exact terminal before routing: " (.getMessage error)))
+                  (try
+                    (let [reverse-result (move-result-value (move-pane* (transport) (assoc record :pane_id (:pane_id @moved)) old-workspace (or (:label source) name)))
+                          reverse (:pane reverse-result)
+                          verified (verify-move-target! expected reverse process-pid native-thread)]
+                      (move-route! flow record (:pane_id verified) false)
+                      (fail (str "Move failed; terminal was returned to original workspace with new pane ID: " (.getMessage error))))
+                    (catch Exception rollback-error
+                      (fail (str "Move and compensation failed; delivery held for manual route repair: " (.getMessage rollback-error))))))))))))))
 (defn send! [flow body wait-presented pane]
   (flow-id! flow) (valid! MessageBody body "MessageBody")
   (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))

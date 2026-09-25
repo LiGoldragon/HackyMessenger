@@ -1,6 +1,6 @@
 (ns hacky-messenger.main
   (:require [hacky-messenger.core :as hm]))
-(defn usage [] (str "Usage: hm-clj <send|register|deregister|rebind|list> ...\n" hm/skill-note))
+(defn usage [] (str "Usage: hm-clj <send|register|deregister|rebind|move|list> ...\n" hm/skill-note))
 (defn arg [xs option] (second (drop-while #(not= option %) xs)))
 (defn parse-error [message] (throw (ex-info message {:hm/parse true})))
 (defn unknown-flags! [xs allowed]
@@ -40,6 +40,15 @@
                        (when-not (every? some? [old-name session pane-id terminal-id agent native-thread])
                          (parse-error "the following arguments are required: --old-name, --session, --pane-id, --terminal-id, --agent, --native-thread"))
                        (println (hm/rebind! flow old-name new-name session pane-id terminal-id agent native-thread))))
+          "move" (let [[flow workspace & rest] xs]
+                   (when-not (and flow workspace) (parse-error "the following arguments are required: flow, workspace"))
+                   (unknown-flags! rest #{"--session" "--pane-id" "--terminal-id" "--name" "--agent" "--native-thread" "--process-pid"})
+                   (let [session (arg rest "--session") pane-id (arg rest "--pane-id") terminal-id (arg rest "--terminal-id")
+                         name (arg rest "--name") agent (arg rest "--agent") native-thread (arg rest "--native-thread") pid-text (arg rest "--process-pid")]
+                     (when-not (every? some? [session pane-id terminal-id name agent native-thread pid-text])
+                       (parse-error "the following arguments are required: --session, --pane-id, --terminal-id, --name, --agent, --native-thread, --process-pid"))
+                     (let [pid (try (parse-long pid-text) (catch Exception _ (parse-error "argument --process-pid: invalid int value")))]
+                       (println (hm/move! flow session pane-id terminal-id name agent native-thread pid workspace)))))
           "list" (println (hm/listing!))
           (parse-error (str "invalid choice: " op)))))
     (catch clojure.lang.ExceptionInfo e
