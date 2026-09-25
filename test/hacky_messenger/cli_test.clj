@@ -49,7 +49,9 @@
           (is (= (str "#msg [\"sender\" \"wait-" wait-result "\"]")
                  (first (str/split-lines (slurp prompt-log)))))
           (is (= 1 (count (filter #(= :Submitting (:reason %)) attempts))))
-          (is (= expected-grade (:grade (last attempts)))))
+          (is (some #(and (= expected-grade (:grade %))
+                          (= (if (zero? expected-exit) :sent :Uncertain) (:reason %)))
+                    attempts)))
         (finally
           (fs/delete-tree root)
           (fs/delete-tree tools))))))
