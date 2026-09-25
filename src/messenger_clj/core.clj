@@ -9,7 +9,7 @@
             [malli.core :as m]))
 
 (def skill-note "Documented by the authored messaging skills in Curriculum. Update those sources with any change to this tool.")
-(def failure-reasons #{:NotRegistered :NeedsBinding :InTransition :RouteHold :IdentityChanged :PaneMissing :NotReady :Blocked :ProcessMismatch :Stalled :Uncertain :RelayOverflow :Submitting :sent})
+(def failure-reasons #{:NotRegistered :NeedsBinding :InTransition :RouteHold :IdentityChanged :PaneMissing :NotReady :Blocked :ProcessMismatch :Stalled :Uncertain :RelayOverflow :Submitting :InvalidBinding :sent})
 (def delivery-grades #{:Transported :Presented :Fallback-Presented :Held :Uncertain})
 (def FlowId [:and [:string {:min 1 :max 96}] [:re #"^[A-Za-z0-9][A-Za-z0-9_-]*$"]])
 (def NativeThread [:and [:string {:min 16 :max 96}] [:re #"^[A-Za-z0-9-]+$"]])
@@ -29,7 +29,11 @@
 (doseq [schema [FlowId NativeThread MessageBody MessageVariant ReadinessProof RouteBinding DeliveryAttempt PendingIntent RetirementMarker Reservation PaneMessage PsycheMessage MessageRequest]] (m/validator schema))
 
 (defn fail [s] (throw (ex-info s {:hm/failure true})))
-(defn valid! [schema value label] (if (m/validate schema value) value (fail (str "Invalid " label ": " (pr-str (m/explain schema value))))))
+(defn valid! [schema value label]
+  (if (m/validate schema value)
+    value
+    (throw (ex-info (str "Invalid " label ": " (pr-str (m/explain schema value)))
+                    {:hm/failure true :hm/invalid true}))))
 (declare ->DatalevinLedger record-attempt! record-pending! route-records nonempty-strings!)
 (defn flow-id! [value]
   (when-not (and (string? value) (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" value))
@@ -38,7 +42,13 @@
 (defn native-thread! [value]
   (when-not (and (string? value) (re-matches #"[A-Za-z0-9-]{16,96}" value)) (fail "Invalid NativeThread"))
   (valid! NativeThread value "NativeThread"))
-(defn route-binding! [value] (valid! RouteBinding (store/route! value) "RouteBinding"))
+(defn route-binding! [value]
+  (try
+    (valid! RouteBinding (store/route! value) "RouteBinding")
+    (catch Exception error
+      (throw (ex-info (.getMessage error)
+                      (assoc (ex-data error) :hm/failure true :hm/invalid true)
+                      error)))))
 (defn delivery-attempt! [value]
   (when-not (and (contains? failure-reasons (:reason value)) (contains? delivery-grades (:grade value)))
     (fail "Invalid DeliveryAttempt grade or reason"))
@@ -201,14 +211,17 @@
              result))
          (catch Exception _ (fail "Herdr returned invalid JSON; do not blindly retry a send")))))
 (declare shell-live-agents)
+(def presented-wait-args ["--wait" "--until" "working" "--until" "idle" "--until" "done"
+                          "--until" "blocked" "--timeout" "10000"])
 (defn direct-prompt! [route envelope wait-presented]
   (let [args (cond-> ["--session" (:session route) "agent" "prompt" (:pane_id route) envelope]
-               wait-presented (into ["--wait" "--timeout" "5000"]))]
+               wait-presented (into presented-wait-args))]
     (apply herdr! args)))
-(defn presented! [reply]
-  ;; Herdr's supported `--wait` response is the observation boundary.  A
-  ;; successful submission reply alone cannot establish pane presentation.
-  (when-not (true? (:presented reply))
+(defn presented! [route reply]
+  ;; A waited Herdr prompt returns agent_prompted after observing one of the
+  ;; requested lifecycle states.  Bind that observation to the exact pane.
+  (when-not (and (= "agent_prompted" (:type reply))
+                 (= (:pane_id route) (get-in reply [:agent :pane_id])))
     (fail "Presentation was not observed; do not retry blindly"))
   reply)
 (defrecord ShellHerdr []
@@ -250,14 +263,17 @@
            (= native (:sessionId value)))
          (catch Exception _ false))))
 (defn process-matches! [route]
-  (let [reply (process-info* (transport) route)
-        info (or (:process_info reply) reply)
-        processes (:foreground_processes info)
-        native (native-thread! (:native_thread route))]
-    (when-not (some #(or (str/includes? (str/join " " (map str (or (:argv %) []))) native)
-                         (and (= "claude" (:agent route)) (claude-session-matches? % native)))
-                    processes)
-      (fail "ProcessMismatch"))))
+  ;; A fallback route without a stored native thread has no native identity to
+  ;; compare.  Exact Herdr pane identity and readiness remain mandatory.
+  (when-let [native-value (:native_thread route)]
+    (let [reply (process-info* (transport) route)
+          info (or (:process_info reply) reply)
+          processes (:foreground_processes info)
+          native (native-thread! native-value)]
+      (when-not (some #(or (str/includes? (str/join " " (map str (or (:argv %) []))) native)
+                           (and (= "claude" (:agent route)) (claude-session-matches? % native)))
+                      processes)
+        (fail "ProcessMismatch")))))
 (defn content-text [content]
   (cond
     (string? content) content
@@ -340,19 +356,24 @@
   (let [[session pane] (str/split (or value "") #":" 2)]
     (when (or (str/blank? session) (str/blank? pane)) (fail "--pane requires <session>:<pane>"))
     {:session session :pane_id pane}))
+(defn fallback-binding [agent native-thread]
+  (route-binding!
+   (cond-> (assoc (select-keys agent [:session :name :pane_id :terminal_id :agent])
+                  :state "Fallback")
+     native-thread (assoc :native_thread native-thread))))
 (defn fallback-route [flow stored pane]
   (cond
     pane (let [{:keys [session pane_id]} (parse-pane pane)
                hits (filter #(and (= session (:session %)) (= pane_id (:pane_id %))) (live-agents))]
            (when-not (= 1 (count hits)) (fail "Held: --pane does not name exactly one live Herdr agent"))
-           (route-binding! (assoc (select-keys (first hits) [:name :pane_id :terminal_id :agent]) :session session :native_thread (or (:native_thread stored) "00000000-0000-0000-0000-000000000000"))))
+           (fallback-binding (assoc (first hits) :session session) (:native_thread stored)))
     stored (let [hits (filter #(and (= (:session stored) (:session %)) (= (:name stored) (:name %))) (live-agents))]
              (when-not (= 1 (count hits)) (fail "Held: stored route has no unique live Herdr agent"))
-             (assoc (first hits) :native_thread (:native_thread stored)))
+             (fallback-binding (first hits) (:native_thread stored)))
     :else (let [suffix (re-pattern (str "\\b" (java.util.regex.Pattern/quote flow) "$"))
                 hits (filter #(re-find suffix (or (:name %) "")) (live-agents))]
             (when-not (= 1 (count hits)) (fail "Held: Flow title has no unique live Herdr agent"))
-            (let [a (first hits)] (route-binding! (assoc (select-keys a [:session :name :pane_id :terminal_id :agent]) :native_thread "00000000-0000-0000-0000-000000000000"))))))
+            (fallback-binding (first hits) nil))))
 (defn exact-live-route? [stored]
   (some #(and (= (:session stored) (:session %))
               (= (:name stored) (:name %))
@@ -385,8 +406,11 @@
     attempt))
 (defn held-reason [error]
   (let [message (.getMessage error)
+        invalid? (:hm/invalid (ex-data error))
         candidate (keyword (or message ""))]
-    (if (contains? failure-reasons candidate) candidate :PaneMissing)))
+    (cond invalid? :InvalidBinding
+          (contains? failure-reasons candidate) candidate
+          :else :PaneMissing)))
 (defn record-uncertain! [flow route request submitted]
   ;; The pre-prompt record is already durable.  Keep the original uncertainty
   ;; if storage is unavailable while recording this post-submit observation.
@@ -444,7 +468,8 @@
                                   "PendingIntent")))
     attempt))
 (defn held! [flow reason request route]
-  (let [{:keys [variant context body part_index part_count]} (request! request)
+  (let [route (when (and route (m/validate RouteBinding route)) route)
+        {:keys [variant context body part_index part_count]} (request! request)
         attempt (append-attempt! flow reason :Held route request nil)
         pending (valid! PendingIntent
                         (cond-> {:attempt attempt :message body :variant variant :state "held"}
@@ -668,7 +693,7 @@
               (try
                 (doseq [key (:interrupt keys)] (send-keys* (transport) route key))
                 (let [reply (prompt!* (transport) route envelope wait-presented)]
-                  (when wait-presented (presented! reply)))
+                  (when wait-presented (presented! route reply)))
                 (doseq [key (:submit keys)] (send-keys* (transport) route key))
               ;; A successful prompt does not prove the terminal stayed bound.
               ;; Recheck before reporting any delivery grade.
@@ -729,15 +754,23 @@
            (when (needs-binding? stored) (held! flow :NeedsBinding request stored))
            (when (:route_hold stored) (held! flow :RouteHold request stored))
            (let [[route fallback?] (try (resolve-send-route flow stored pane)
-                                        (catch Exception _ (held! flow (if stored :PaneMissing :NotRegistered) request stored)))
+                                        (catch Exception error
+                                          (held! flow (cond (:hm/invalid (ex-data error)) :InvalidBinding
+                                                            stored :PaneMissing
+                                                            :else :NotRegistered)
+                                                 request stored)))
                  live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) request route)))
                  envelope (message-envelope sender request)
-                 submission (append-attempt! flow :Submitting :Uncertain route request envelope)
+                 submission (try (append-attempt! flow :Submitting :Uncertain route request envelope)
+                                 (catch Exception error
+                                   (if (:hm/invalid (ex-data error))
+                                     (held! flow :InvalidBinding request route)
+                                     (throw error))))
                  grade (if fallback? :Fallback-Presented (if wait-presented :Presented :Transported))]
              (try
                (let [waited? (or fallback? wait-presented)
                      reply (prompt!* (transport) route envelope waited?)]
-                 (when waited? (presented! reply)))
+                 (when waited? (presented! route reply)))
                (verify-target! route)
                (record-sent! flow grade route submission live request envelope)
                (catch Exception error

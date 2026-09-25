@@ -26,10 +26,10 @@ case "$*" in
   *"agent prompt "*"--wait"*)
     record_prompt "$@"
     case "${FAKE_HERDR_WAIT:-presented}" in
-      presented) printf '%s\n' '{"result":{"presented":true}}' ;;
+      presented) printf '{"id":"cli:agent:prompt","result":{"type":"agent_prompted","agent":{"name":"Mind Sol 00f95a","pane_id":"%s","terminal_id":"t","agent":"codex","agent_status":"idle"}}}\n' "$pane" ;;
       submitted) printf '%s\n' '{"result":{"ok":true}}' ;;
       timeout) printf '%s\n' '{"error":{"code":"agent_prompt_stalled"}}'; exit 1 ;;
     esac ;;
-  *"agent prompt "*) record_prompt "$@"; printf '%s\n' '{"result":{"ok":true}}' ;;
+  *"agent prompt "*) record_prompt "$@"; printf '{"id":"cli:agent:prompt","result":{"type":"agent_prompted","agent":{"name":"Mind Sol 00f95a","pane_id":"%s","terminal_id":"t","agent":"codex","agent_status":"working"}}}\n' "$pane" ;;
   *) printf '%s\n' '{"error":{"code":"unexpected"}}'; exit 1 ;;
 esac

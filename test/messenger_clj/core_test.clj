@@ -11,6 +11,10 @@
             :agent "codex" :native_thread "00000000-0000-0000-0000-000000000000"})
 
 (defn pass-reservation [_ f] (f))
+(defn prompted [pane-route]
+  {:type "agent_prompted"
+   :agent (assoc (select-keys pane-route [:name :pane_id :terminal_id :agent])
+                 :agent_status "idle")})
 (defn persist-route! [root-path value]
   (store/put-route! root-path "00f95a" value))
 (defn fake-transport [live-agent target-agent processes prompts]
@@ -205,16 +209,18 @@
                   (persist-route! root-path record)
                   [(try (hm/send-abrupt! "00f95a" "receipt" true)
                         (catch Exception error (.getMessage error))) @events])))]
-    (let [[result events] (run route {:presented true} route)]
+    (let [[result events] (run route (prompted route) route)]
       (is (= "Presented.{ 00f95a working }" result))
       (is (= [[:key "esc"] [:prompt true]] events)))
-    (let [[result events] (run (assoc route :agent "claude") {:presented true} (assoc route :agent "claude"))]
+    (let [[result events] (run (assoc route :agent "claude")
+                               (prompted (assoc route :agent "claude"))
+                               (assoc route :agent "claude"))]
       (is (= "Presented.{ 00f95a working }" result))
       (is (= [[:key "esc"] [:key "esc"] [:prompt true] [:key "enter"]] events)))
     (let [[result events] (run route {:ok true} route)]
       (is (re-find #"Uncertain\.\{ 00f95a attempt-.*Escape was sent" result))
       (is (= [[:key "esc"] [:prompt true]] events)))
-    (let [[result events] (run route {:presented true} (assoc route :terminal_id "other"))]
+    (let [[result events] (run route (prompted route) (assoc route :terminal_id "other"))]
       (is (re-find #"Held\.\{ 00f95a" result))
       (is (empty? events)))))
 
@@ -350,7 +356,9 @@
       (let [calls (atom [])]
         (with-redefs [hm/live-agents (constantly [(assoc route :pane_id "moved")])
                       hm/verify-target! (fn [_] route)
-                      hm/direct-prompt! (fn [& args] (swap! calls conj args) {:presented true})]
+                      hm/direct-prompt! (fn [& args]
+                                          (swap! calls conj args)
+                                          (prompted (assoc route :pane_id "moved")))]
           (is (= "Fallback-Presented.{ 00f95a unknown }"
                  (hm/send! "00f95a" "fallback" false nil)))
           (is (= 1 (count @calls)))
@@ -384,14 +392,107 @@
                        [(try (hm/send! "00f95a" "plain wait" true nil)
                              (catch Exception error (.getMessage error)))
                         @calls]))))]
-    (let [[result calls] (invoke {:presented true})]
+    (let [[result calls] (invoke (prompted route))]
       (is (= "Presented.{ 00f95a unknown }" result))
       (is (= 1 (count calls)))
       (is (true? (nth (first calls) 2))))
     (let [[result calls] (invoke {:ok true})]
       (is (re-find #"Uncertain\.\{ 00f95a" result))
       (is (= 1 (count calls)))
-      (is (true? (nth (first calls) 2))))))
+      (is (true? (nth (first calls) 2))))
+    (let [[result calls] (invoke {:presented true})]
+      (is (re-find #"Uncertain\.\{ 00f95a" result))
+      (is (= 1 (count calls))))
+    (let [[result calls] (invoke (prompted (assoc route :pane_id "other")))]
+      (is (re-find #"Uncertain\.\{ 00f95a" result))
+      (is (= 1 (count calls))))))
+
+(defn herdr-agent [overrides]
+  (merge {:agent "claude" :agent_status "idle" :cwd "/home/li/primary"
+          :focused false :foreground_cwd "/home/li/primary" :interactive_ready true
+          :name "Mind Sol 00f95a" :pane_id "moved" :revision 7 :state_change_seq 42
+          :tab_id "w1:t3" :terminal_id "t" :workspace_id "w1"}
+         overrides))
+
+(defn fallback-transport [session agents argv prompts & {:keys [reply target]}]
+  (reify hm/HerdrTransport
+    (live-agents* [_] (map #(assoc % :session session) (vals agents)))
+    (target-agent* [_ requested]
+      {:agent (or target (get agents (:pane_id requested)))})
+    (process-info* [_ _]
+      {:process_info {:foreground_processes [{:pid 7 :argv argv}]}})
+    (pane* [_ _] (throw (ex-info "unexpected pane" {})))
+    (move-pane* [_ _ _ _] (throw (ex-info "unexpected move" {})))
+    (send-keys* [_ _ _] (throw (ex-info "unexpected keys" {})))
+    (prompt!* [_ requested envelope wait?]
+      (swap! prompts conj {:pane (:pane_id requested) :envelope envelope :wait wait?})
+      (or reply (prompted (get agents (:pane_id requested)))))))
+
+(defn g1-send [root-path transport & args]
+  (binding [hm/*root* root-path hm/*flow-id* "sender"
+            hm/*with-reservation* pass-reservation hm/*transport* transport]
+    (try (apply hm/send! args) (catch Exception error (.getMessage error)))))
+
+(deftest g1-stored-name-fallback-normalizes-live-agent-and-prompts-once
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-g1-stored-"}))
+        prompts (atom [])
+        native (:native_thread route)
+        transport (fallback-transport "s" {"moved" (herdr-agent {})}
+                                      ["codex" "--thread" native] prompts)]
+    (persist-route! root-path (assoc route :agent "claude"))
+    (is (= "Fallback-Presented.{ 00f95a idle }"
+           (g1-send root-path transport "00f95a" "after a move" false nil 0)))
+    (is (= 1 (count @prompts)))
+    (is (= {:pane "moved" :wait true}
+           (select-keys (first @prompts) [:pane :wait])))
+    (is (= "#msg [\"sender\" \"after a move\"]" (:envelope (first @prompts))))
+    (let [sent (first (filter #(= :sent (:reason %))
+                              (store/attempts-for root-path "00f95a")))]
+      (is (= :Fallback-Presented (:grade sent)))
+      (is (= {:session "s" :name "Mind Sol 00f95a" :pane_id "moved"
+              :terminal_id "t" :agent "claude" :native_thread native
+              :state "Fallback"}
+             (:binding sent))))))
+
+(deftest g1-pane-fallback-has-no-fabricated-native-thread
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-g1-pane-"}))
+        prompts (atom [])
+        live (herdr-agent {:pane_id "w9:p1" :name "disposable-g1"
+                           :terminal_id "term_d" :agent "codex"})
+        transport (fallback-transport "d" {"w9:p1" live} ["zsh"] prompts)]
+    (is (= "Fallback-Presented.{ 00f95a idle }"
+           (g1-send root-path transport "00f95a" "to a pane" false "d:w9:p1" 0)))
+    (is (= 1 (count @prompts)))
+    (let [sent (first (filter #(= :sent (:reason %))
+                              (store/attempts-for root-path "00f95a")))]
+      (is (= "Fallback" (get-in sent [:binding :state])))
+      (is (nil? (get-in sent [:binding :native_thread]))))))
+
+(deftest g1-invalid-fallback-is-held-durably-before-prompt
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-g1-invalid-"}))
+        prompts (atom [])
+        live (herdr-agent {:pane_id "w9:p1" :name nil})
+        transport (fallback-transport "d" {"w9:p1" live} ["zsh"] prompts)
+        result (g1-send root-path transport "00f95a" "secret body" false "d:w9:p1" 0)]
+    (is (re-find #"^Held\.\{ 00f95a InvalidBinding attempt-[0-9a-f-]{12} \}$" result))
+    (is (not (str/includes? result "secret body")))
+    (is (empty? @prompts))
+    (let [pending (store/pending-for root-path "00f95a")]
+      (is (= 1 (count pending)))
+      (is (= "secret body" (:message (first pending))))
+      (is (= :InvalidBinding (get-in (first pending) [:attempt :reason]))))))
+
+(deftest g1-presented-wait-names-all-observable-states
+  (let [calls (atom [])]
+    (with-redefs [hm/herdr! (fn [& args] (swap! calls conj (vec args)) {:type "agent_prompted"})]
+      (hm/direct-prompt! route "#msg [\"sender\" \"x\"]" true)
+      (hm/direct-prompt! route "#msg [\"sender\" \"y\"]" false))
+    (is (= ["--session" "s" "agent" "prompt" "p" "#msg [\"sender\" \"x\"]"
+            "--wait" "--until" "working" "--until" "idle" "--until" "done"
+            "--until" "blocked" "--timeout" "10000"]
+           (first @calls)))
+    (is (= ["--session" "s" "agent" "prompt" "p" "#msg [\"sender\" \"y\"]"]
+           (second @calls)))))
 
 (deftest ledger-failure-prevents-the-live-send-prompt
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-ledger-"}))

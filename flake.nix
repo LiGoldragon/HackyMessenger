@@ -18,7 +18,7 @@
           };
         in pkgs.stdenvNoCC.mkDerivation {
           pname = "messenger-clj";
-          version = "0.2.0";
+          version = "0.2.1";
           src = nixpkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
