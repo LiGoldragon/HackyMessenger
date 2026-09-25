@@ -24,7 +24,7 @@
 
 (defn fail [s] (throw (ex-info s {:hm/failure true})))
 (defn valid! [schema value label] (if (m/validate schema value) value (fail (str "Invalid " label ": " (pr-str (m/explain schema value))))))
-(declare atomic-edn! ->EdnLedger record-attempt!)
+(declare atomic-edn! ->EdnLedger record-attempt! record-pending!)
 (defn flow-id! [value]
   (when-not (and (string? value) (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" value)) (fail "Invalid FlowId"))
   (valid! FlowId value "FlowId"))
@@ -154,7 +154,7 @@
         pending (valid! PendingIntent {:attempt attempt :message body :state "held"} "PendingIntent")
         destination (fs/path (root) "pending" (str (:id attempt) ".edn"))]
     (atomic-edn! destination pending)
-    (store/index-pending! (root) attempt body)
+    (record-pending! (->EdnLedger (root)) attempt body)
     (fail (str "Held.{ " flow " " (name reason) " attempt-" (subs (:id attempt) 0 12) " }"))))
 (defn register! [flow name session native-thread]
   (valid! FlowId flow "FlowId") (valid! NativeThread native-thread "NativeThread")
