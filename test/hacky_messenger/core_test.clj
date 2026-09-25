@@ -103,7 +103,10 @@
 (deftest closed-core-records-and-deep-relays-are-rejected
   (is (false? (malli.core/validate hm/RouteBinding (assoc route :unexpected true))))
   (is (hm/nested-relay? "#msg [\"sender\" \"body\"]"))
-  (is (hm/nested-relay? "Machine.Relay.{ relayed }")))
+  (is (false? (hm/nested-relay? "prose mentioning #msg is allowed")))
+  (is (false? (hm/nested-relay? "Machine.Relay.{ relayed }")))
+  (is (false? (hm/nested-relay? "#msg [\"sender\" \"body\"] trailing")))
+  (is (thrown? Exception (hm/read-pane-message "[\"sender\" \"body\"]"))))
 
 (deftest abrupt-send-is-durable-gated-and-agent-specific
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-abrupt-"}))

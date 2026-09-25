@@ -1,5 +1,6 @@
 (ns hacky-messenger.core
-  (:import [java.nio ByteBuffer]
+  (:import [java.io PushbackReader StringReader]
+           [java.nio ByteBuffer]
            [java.nio.channels FileChannel]
            [java.nio.file Files OpenOption StandardCopyOption StandardOpenOption]
            [java.nio.file.attribute PosixFilePermissions])
@@ -80,8 +81,18 @@
   ;; `data_readers.clj` binds #msg to this function for Clojure readers.  The
   ;; tagged value is deliberately just the two pane-visible fields.
   (valid! PaneMessage value "#msg"))
+(defn- read-complete [readers line]
+  (with-open [reader (PushbackReader. (StringReader. line))]
+    (let [eof (Object.)
+          value (edn/read {:readers readers :eof eof} reader)]
+      (when (or (identical? eof value)
+                (not (identical? eof (edn/read {:readers readers :eof eof} reader))))
+        (fail "Expected exactly one complete EDN form"))
+      value)))
 (defn read-pane-message [line]
-  (edn/read-string {:readers {'msg read-msg}} line))
+  (let [tagged ::tagged
+        value (read-complete {'msg #(hash-map tagged (read-msg %))} line)]
+    (or (get value tagged) (fail "Expected one complete #msg form"))))
 (defn relay-line [sender _recipient body]
   (let [message (read-msg [sender body])
         line (str "#msg " (pr-str message))]
@@ -146,13 +157,7 @@
             pointer (str "Message too long for a pane; read " path " in full.")]
         (relay sender recipient pointer)))))
 (defn nested-relay? [body]
-  (or (str/includes? body "#msg")
-      (str/includes? body "Machine.Relay.{")
-      (try
-        (let [value (read-pane-message body)]
-          (boolean (some #(and (map? %) (contains? % :machine/relay))
-                         (tree-seq coll? seq value))))
-        (catch Exception _ false))))
+  (try (read-pane-message body) true (catch Exception _ false)))
 (defn read-route [flow]
   (try
     (if-let [route (load-route (registry) flow)]
@@ -663,6 +668,12 @@
 (defn route-records []
   (into {} (remove (fn [[flow _]] (store/retirement-for (root) flow))
                    (store/routes (root)))))
+(defn heartbeat-state! []
+  (json/generate-string
+   {:version 1
+    :routes (mapv (fn [[flow route]] {:flow flow :route route})
+                  (sort-by key (route-records)))
+    :retirements (store/retirements (root))}))
 (defn route-matches-agent? [route agent]
   (and (= (:session route) (:session agent))
        (= (:name route) (:name agent))

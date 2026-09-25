@@ -4,6 +4,7 @@
             [clojure.edn :as edn]
             [clojure.string :as str]
             [clojure.test :refer [deftest is]]
+            [cheshire.core :as json]
             [hacky-messenger.core :as hm]
             [hacky-messenger.legacy-import-test :as legacy-test]
             [hacky-messenger.typed-store :as store]))
@@ -56,6 +57,15 @@
       (let [listed (invoke environment "hm-clj-list")]
         (is (zero? (:exit listed)) (:err listed))
         (is (str/includes? (:out listed) "00f95a\tMind Sol 00f95a\ts\tworking")))
+      (let [snapshot (invoke environment "hm-clj-heartbeat-state")
+            value (json/parse-string (:out snapshot) true)]
+        (is (zero? (:exit snapshot)) (:err snapshot))
+        (is (= 1 (:version value)))
+        (is (= [{:flow "00f95a"
+                 :route {:session "s" :name "Mind Sol 00f95a" :pane_id "p" :terminal_id "t"
+                         :agent "codex" :native_thread native-thread :state "Bound"}}]
+               (:routes value)))
+        (is (= [] (:retirements value))))
       (let [sent (invoke environment "hm-clj-send" "00f95a" "isolated-success")]
         (is (zero? (:exit sent)) (:err sent))
         (is (str/includes? (:out sent) "Transported.{ 00f95a working }"))
@@ -109,6 +119,11 @@
         (is (zero? (:exit retired)) (:err retired))
         (is (= "sender" (:retired_by (store/retirement-for root "00f95a"))))
         (is (nil? (store/route-for root "00f95a")))
+        (let [snapshot (invoke environment "hm-clj-heartbeat-state")
+              value (json/parse-string (:out snapshot) true)]
+          (is (zero? (:exit snapshot)) (:err snapshot))
+          (is (= [] (:routes value)))
+          (is (= ["00f95a"] (mapv :flow (:retirements value)))))
         (is (empty? (fs/glob root "**/*.edn"))
             "operational commands create no EDN authority files"))
       (finally

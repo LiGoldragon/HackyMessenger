@@ -1,7 +1,7 @@
 (ns hacky-messenger.main
   (:require [hacky-messenger.core :as hm]
             [hacky-messenger.legacy-import :as legacy]))
-(defn usage [] (str "Usage: hm-clj <send|send-abrupt|register|deregister|rebind|move|retire|import-retirement|import-json|list> ...\n" hm/skill-note))
+(defn usage [] (str "Usage: hm-clj <send|send-abrupt|register|deregister|rebind|move|retire|import-retirement|import-json|heartbeat-state|list> ...\n" hm/skill-note))
 (defn arg [xs option] (second (drop-while #(not= option %) xs)))
 (defn parse-error [message] (throw (ex-info message {:hm/parse true})))
 (def value-options #{"--session" "--native-thread" "--readiness-probe" "--rollout" "--old-name" "--pane-id" "--terminal-id" "--name" "--agent" "--process-pid" "--evidence" "--evidence-sha256" "--hold-seconds" "--pane" "--target" "--receipt"})
@@ -105,6 +105,8 @@
                               (parse-error "the following arguments are required: --target, --receipt"))
                             (println (legacy/import-json! source target receipt
                                                           (boolean (some #{"--apply"} rest))))))
+          "heartbeat-state" (do (when (seq xs) (parse-error "unrecognized arguments"))
+                                (println (hm/heartbeat-state!)))
           "list" (do (when (seq xs) (parse-error "unrecognized arguments")) (println (hm/listing!)))
           (parse-error (str "invalid choice: " op)))))
     (catch clojure.lang.ExceptionInfo e
