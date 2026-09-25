@@ -92,6 +92,12 @@
   (let [args (cond-> ["--session" (:session route) "agent" "prompt" (:pane_id route) envelope]
                wait-presented (into ["--wait" "--timeout" "5000"]))]
     (apply herdr! args)))
+(defn presented! [reply]
+  ;; Herdr's supported `--wait` response is the observation boundary.  A
+  ;; successful submission reply alone cannot establish pane presentation.
+  (when-not (true? (:presented reply))
+    (fail "Presentation was not observed; do not retry blindly"))
+  reply)
 (defrecord ShellHerdr []
   HerdrTransport
   (live-agents* [_] (shell-live-agents))
@@ -230,7 +236,9 @@
                   envelope (relay sender flow body)
                   submission (append-attempt! flow :Submitting :Uncertain route)]
               (try
-                (prompt!* (transport) route envelope wait-presented)
+                (let [wait? (or fallback? wait-presented)
+                      reply (prompt!* (transport) route envelope wait?)]
+                  (when fallback? (presented! reply)))
                 (let [grade (if fallback? :Fallback-Presented (if wait-presented :Presented :Transported))]
                   (append-attempt! flow :sent grade route)
                   (str (name grade) ".{ " flow " " (or (:agent_status live) "unknown") " }"))

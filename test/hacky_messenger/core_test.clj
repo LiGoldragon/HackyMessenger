@@ -68,21 +68,32 @@
   (with-redefs [hm/live-agents (constantly [(assoc route :session "override" :pane_id "chosen")])]
     (is (= "chosen" (:pane_id (first (hm/resolve-send-route "00f95a" nil "override:chosen")))))))
 
-(deftest stale-route-is-fallback-presented-and-prompt-failure-is-not-retried
+(deftest fallback-presentation-requires-an-observed-wait-without-retry
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-send-"}))]
     (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation]
       (hm/atomic-edn! (hm/path "00f95a") route)
-      (with-redefs [hm/live-agents (constantly [(assoc route :pane_id "moved")])
-                    hm/verify-target! (fn [_] route)
-                    hm/direct-prompt! (fn [_ _ _] nil)]
-        (is (= "Fallback-Presented.{ 00f95a unknown }"
-               (hm/send! "00f95a" "fallback" false nil))))
-      (let [calls (atom 0)]
-        (with-redefs [hm/live-agents (constantly [route])
+      (let [calls (atom [])]
+        (with-redefs [hm/live-agents (constantly [(assoc route :pane_id "moved")])
                       hm/verify-target! (fn [_] route)
-                      hm/direct-prompt! (fn [& _] (swap! calls inc) (hm/fail "connection lost"))]
+                      hm/direct-prompt! (fn [& args] (swap! calls conj args) {:presented true})]
+          (is (= "Fallback-Presented.{ 00f95a unknown }"
+                 (hm/send! "00f95a" "fallback" false nil)))
+          (is (= 1 (count @calls)))
+          (is (true? (nth (first @calls) 2)))))
+      (let [calls (atom 0)]
+        (with-redefs [hm/live-agents (constantly [(assoc route :pane_id "moved")])
+                      hm/verify-target! (fn [_] route)
+                      hm/direct-prompt! (fn [& _] (swap! calls inc) {:ok true})]
           (is (re-find #"Uncertain\.\{ 00f95a"
-                       (try (hm/send! "00f95a" "once" false nil)
+                       (try (hm/send! "00f95a" "submission-only" false nil)
+                            (catch Exception error (.getMessage error)))))
+          (is (= 1 @calls))))
+      (let [calls (atom 0)]
+        (with-redefs [hm/live-agents (constantly [(assoc route :pane_id "moved")])
+                      hm/verify-target! (fn [_] route)
+                      hm/direct-prompt! (fn [& _] (swap! calls inc) (hm/fail "wait timeout"))]
+          (is (re-find #"Uncertain\.\{ 00f95a"
+                       (try (hm/send! "00f95a" "timeout" false nil)
                             (catch Exception error (.getMessage error)))))
           (is (= 1 @calls)))))))
 
