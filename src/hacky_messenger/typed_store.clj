@@ -45,6 +45,11 @@
   (let [retirement (retirement! retirement)] [(assoc (dissoc retirement :retirement/flow) :retirement/flow [:flow/id (:retirement/flow retirement)])]))
 (defn export-edn [entities] (pr-str entities))
 (defn import-edn [value] (when-not (sequential? value) (throw (ex-info "Typed import must be sequential EDN" {}))) value)
+(defn checked-rows! [rows width]
+  (when-not (and (set? rows) (every? #(and (vector? %) (= width (count %))) rows))
+    (throw (ex-info "Malformed typed Datalevin query row" {:rows rows :width width}))) rows)
+(defn retirement-precedes? [retirements flow]
+  (boolean (some #(= flow (:retirement/flow %)) retirements)))
 (defn database-path [root] (str (fs/path root "typed-datalevin")))
 (defn with-db [root f]
   (let [conn (call 'pod.huahaiy.datalevin/get-conn (database-path root) schema)]

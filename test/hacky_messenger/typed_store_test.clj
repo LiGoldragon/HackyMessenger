@@ -14,3 +14,9 @@
     (typed/put-route! root route)
     (typed/put-route! root route)
     (is (= route (typed/route-for root "00f95a")))))
+(deftest staged-import-export-and-row-shapes-are-explicit
+  (let [historical {:attempt/id "old" :attempt/flow "00f95a" :attempt/at "then" :attempt/grade :Held :attempt/reason :Legacy}
+        retirement {:retirement/flow "00f95a" :retirement/evidence "e" :retirement/at "now" :retirement/retired-by "Mind"}]
+    (is (= [historical] (typed/import-edn [historical])))
+    (is (typed/retirement-precedes? [retirement] "00f95a"))
+    (is (thrown? Exception (typed/checked-rows! #{["x"]} 2)))))
