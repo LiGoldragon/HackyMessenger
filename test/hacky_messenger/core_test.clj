@@ -20,6 +20,7 @@
     (pane* [_ route] {:pane (select-keys route [:pane_id :terminal_id :agent])})
     (move-pane* [_ route _ _] {:move_result {:previous_pane_id (:pane_id route) :previous_workspace_id "w1"
                                              :pane (assoc (select-keys route [:terminal_id :agent]) :pane_id "moved" :workspace_id "w2")}})
+    (send-keys* [_ _ _] {:ok true})
     (prompt!* [_ _ _ _] (swap! prompts inc) {:ok true})))
 
 (defn move-transport [route mode moves]
@@ -40,6 +41,7 @@
         (reset! moves next-pane)
         {:move_result {:previous_pane_id (:pane_id requested) :previous_workspace_id previous-workspace
                        :pane {:pane_id next-pane :terminal_id (:terminal_id route) :agent (:agent route) :workspace_id workspace}}}))
+    (send-keys* [_ _ _] {:ok true})
     (prompt!* [_ _ _ _] {:ok true})))
 
 (deftest identifiers-and-title-fallback-are-strict
@@ -67,6 +69,37 @@
   (is (re-find #"Nested Machine\.Relay"
                (try (hm/send! "00f95a" (pr-str {:machine/relay ["machine" "sender" "heard" "seat" ["00f95a"] "body" ""]}) false nil)
                     (catch Exception error (.getMessage error))))))
+
+(deftest abrupt-send-is-durable-gated-and-agent-specific
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-abrupt-"}))
+        process [{:argv ["codex" "--thread" (:native_thread route)]}]
+        run (fn [record reply target]
+              (let [events (atom [])
+                    transport (reify hm/HerdrTransport
+                                (live-agents* [_] [(assoc record :interactive_ready true :agent_status "working")])
+                                (target-agent* [_ _] {:agent (assoc target :interactive_ready true :agent_status "working")})
+                                (process-info* [_ _] {:process_info {:foreground_processes process}})
+                                (pane* [_ _] {:pane {}})
+                                (move-pane* [_ _ _ _] {:move_result {}})
+                                (send-keys* [_ _ key] (swap! events conj [:key key]) {:ok true})
+                                (prompt!* [_ _ _ wait?] (swap! events conj [:prompt wait?]) reply))]
+                (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation hm/*transport* transport]
+                  (hm/atomic-edn! (hm/path "00f95a") record)
+                  (store/index-route! root-path "00f95a" record)
+                  [(try (hm/send-abrupt! "00f95a" "receipt" true)
+                        (catch Exception error (.getMessage error))) @events])))]
+    (let [[result events] (run route {:presented true} route)]
+      (is (= "Presented.{ 00f95a working }" result))
+      (is (= [[:key "esc"] [:prompt true]] events)))
+    (let [[result events] (run (assoc route :agent "claude") {:presented true} (assoc route :agent "claude"))]
+      (is (= "Presented.{ 00f95a working }" result))
+      (is (= [[:key "esc"] [:key "esc"] [:prompt true] [:key "enter"]] events)))
+    (let [[result events] (run route {:ok true} route)]
+      (is (re-find #"Uncertain\.\{ 00f95a attempt-.*Escape was sent" result))
+      (is (= [[:key "esc"] [:prompt true]] events)))
+    (let [[result events] (run route {:presented true} (assoc route :terminal_id "other"))]
+      (is (re-find #"Held\.\{ 00f95a" result))
+      (is (empty? events)))))
 
 (deftest datalevin-pod-indexes-and-queries-attempts
   (let [root (str (fs/create-temp-dir {:prefix "hm-datalevin-"}))
@@ -209,6 +242,7 @@
                     (process-info* [_ _] {:process_info {:foreground_processes []}})
                     (pane* [_ _] {:pane {}})
                     (move-pane* [_ _ _ _] {:move_result {}})
+                    (send-keys* [_ _ _] {:ok true})
                     (prompt!* [_ _ _ _] (swap! prompts inc) {:ok true}))
         user {:type "event_msg" :payload {:thread_id (:native_thread route)
                                           :item {:type "UserMessage" :content [{:text (str "Reply " marker)}]}}}

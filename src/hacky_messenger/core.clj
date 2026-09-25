@@ -46,6 +46,7 @@
   (process-info* [this route])
   (pane* [this route])
   (move-pane* [this route workspace label])
+  (send-keys* [this route key])
   (prompt!* [this route envelope wait?]))
 (defprotocol Ledger (record-attempt! [this attempt]) (record-pending! [this attempt body]))
 (defprotocol Clock (current-time [this]))
@@ -116,6 +117,7 @@
   (process-info* [_ route] (herdr! "--session" (:session route) "pane" "process-info" "--pane" (:pane_id route)))
   (pane* [_ route] (herdr! "--session" (:session route) "pane" "get" (:pane_id route)))
   (move-pane* [_ route workspace label] (herdr! "--session" (:session route) "pane" "move" (:pane_id route) "--new-tab" "--workspace" workspace "--label" label "--no-focus"))
+  (send-keys* [_ route key] (herdr! "--session" (:session route) "agent" "send-keys" (:pane_id route) key))
   (prompt!* [_ route envelope wait?] (direct-prompt! route envelope wait?)))
 (defn transport [] (or *transport* (->ShellHerdr)))
 (defn sha256 [file]
@@ -468,6 +470,35 @@
                     (if rollback-error
                       (fail (str "Move and compensation failed; delivery held for manual route repair: " (.getMessage rollback-error)))
                       (fail (str "Move failed; terminal was returned to original workspace with new pane ID: " (.getMessage error))))))))))))))
+(def abrupt-keys {"codex" {:interrupt ["esc"] :submit []}
+                  "claude" {:interrupt ["esc" "esc"] :submit ["enter"]}})
+(defn send-abrupt! [flow body wait-presented]
+  (flow-id! flow) (valid! MessageBody body "MessageBody")
+  (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))
+  (when (nested-relay? body) (fail "Nested Machine.Relay is not a message body"))
+  (let [sender (or *flow-id* (System/getenv "FLOW_ID") (fail "Set FLOW_ID to your own flow ID before sending"))]
+    (with-reservation flow
+      (fn []
+        (assert-not-retired! flow)
+        (let [route (read-route flow)
+              live (try (verify-target! route) (catch Exception error (held! flow (keyword (or (.getMessage error) "IdentityChanged")) body route)))
+              keys (get abrupt-keys (:agent route))]
+          (when-not keys (fail (str "Hard-abrupt is not supported for " (:agent route) "; nothing sent")))
+          (let [envelope (relay sender flow body)
+                submission (append-attempt! flow :Submitting :Uncertain route)]
+            (try
+              (doseq [key (:interrupt keys)] (send-keys* (transport) route key))
+              (let [reply (prompt!* (transport) route envelope wait-presented)]
+                (when wait-presented (presented! reply)))
+              (doseq [key (:submit keys)] (send-keys* (transport) route key))
+              ;; A successful prompt does not prove the terminal stayed bound.
+              ;; Recheck before reporting any delivery grade.
+              (verify-target! route)
+              (append-attempt! flow :sent (if wait-presented :Presented :Transported) route)
+              (str (if wait-presented "Presented" "Transported") ".{ " flow " " (or (:agent_status live) "unknown") " }")
+              (catch Exception error
+                (append-attempt! flow :Uncertain :Uncertain route)
+                (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } Escape was sent; prompt failed or is uncertain: " (.getMessage error)))))))))))
 (defn send! [flow body wait-presented pane]
   (flow-id! flow) (valid! MessageBody body "MessageBody")
   (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))

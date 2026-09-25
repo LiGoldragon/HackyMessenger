@@ -10,6 +10,7 @@ case "$*" in
     fi ;;
   "--session s agent get p") printf '%s\n' '{"agent":{"name":"Mind Sol 00f95a","pane_id":"p","terminal_id":"t","agent":"codex","interactive_ready":true,"agent_status":"working"}}' ;;
   "--session s pane process-info --pane p") printf '%s\n' '{"process_info":{"foreground_processes":[{"argv":["codex","--thread","00000000-0000-0000-0000-000000000000"]}]}}' ;;
+  "--session s agent send-keys p esc"|"--session s agent send-keys p enter") printf '%s\n' '{"result":{"ok":true}}' ;;
   *"agent prompt p"*"--wait"*)
     case "${FAKE_HERDR_WAIT:-presented}" in
       presented) printf '%s\n' '{"result":{"presented":true}}' ;;
