@@ -29,13 +29,14 @@ instruction to read that file.
 
 ## Commands
 
-Eight unprefixed commands on `PATH` run the typed Clojure implementation:
+Nine unprefixed commands on `PATH` run the typed Clojure implementation:
 
 ```text
 hm-send          hm-send-abrupt
 hm-list          hm-register
 hm-deregister    hm-rebind
 hm-move          hm-retire
+hm-heartbeat-state
 ```
 
 `FLOW_ID=<self> hm-send TARGET 'text'` is the ordinary send. `hm-send-abrupt`
@@ -44,9 +45,12 @@ the exact live or stale route identity shown by Herdr; use their `--help`
 output and the `compensation-hacky-messenger` Curriculum skill for the full
 arguments and receipt meanings.
 
+`hm-heartbeat-state` takes no message body or other arguments. It reads the
+typed store and prints a read-only view of current routes and retirements for
+the heartbeat consumer; it does not send or mutate a message.
+
 The Clojure-only maintenance commands are exposed with the `hm-clj-` prefix:
-`hm-clj-import-json`, `hm-clj-import-retirement`, and
-`hm-clj-heartbeat-state`.
+`hm-clj-import-json` and `hm-clj-import-retirement`.
 
 ## Authority and storage
 
