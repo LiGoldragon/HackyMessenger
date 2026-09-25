@@ -77,3 +77,19 @@
                        (try (hm/send! "00f95a" "once" false nil)
                             (catch Exception error (.getMessage error)))))
           (is (= 1 @calls)))))))
+
+(deftest ledger-failure-prevents-the-live-send-prompt
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-ledger-"}))
+        prompts (atom 0)
+        failing (reify hm/Ledger
+                  (record-attempt! [_ _] (hm/fail "ledger unavailable"))
+                  (record-pending! [_ _ _] nil))]
+    (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*ledger* failing]
+      (hm/atomic-edn! (hm/path "00f95a") route)
+      (with-redefs [hm/live-agents (constantly [route])
+                    hm/verify-target! (fn [_] route)
+                    hm/direct-prompt! (fn [& _] (swap! prompts inc))]
+        (is (re-find #"ledger unavailable"
+                     (try (hm/send! "00f95a" "body" false nil)
+                          (catch Exception error (.getMessage error)))))
+        (is (zero? @prompts))))))

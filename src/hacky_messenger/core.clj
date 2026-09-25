@@ -47,6 +47,7 @@
   (save-route! [_ flow route] (atomic-edn! (fs/path state-root (str (flow-id! flow) ".edn")) (route-binding! route))))
 (def ^:dynamic *root* nil)
 (def ^:dynamic *flow-id* nil)
+(def ^:dynamic *ledger* nil)
 (defn root [] (fs/absolutize (or *root* (System/getenv "HM_REGISTRY") (str (fs/path (System/getProperty "user.home") ".local/state/hacky-messenger")))))
 (defn path [flow] (fs/path (root) (str (flow-id! flow) ".edn")))
 (defn now [] (current-time (->SystemClock)))
@@ -139,7 +140,7 @@
                   route (assoc :binding route))]
     (delivery-attempt! attempt)
     (fs/create-dirs (root))
-    (record-attempt! (->EdnLedger (root)) attempt)))
+    (record-attempt! (or *ledger* (->EdnLedger (root))) attempt)))
 (defrecord EdnLedger [state-root]
   Ledger
   (record-attempt! [_ attempt]
@@ -154,7 +155,7 @@
         pending (valid! PendingIntent {:attempt attempt :message body :state "held"} "PendingIntent")
         destination (fs/path (root) "pending" (str (:id attempt) ".edn"))]
     (atomic-edn! destination pending)
-    (record-pending! (->EdnLedger (root)) attempt body)
+    (record-pending! (or *ledger* (->EdnLedger (root))) attempt body)
     (fail (str "Held.{ " flow " " (name reason) " attempt-" (subs (:id attempt) 0 12) " }"))))
 (defn register! [flow name session native-thread]
   (valid! FlowId flow "FlowId") (valid! NativeThread native-thread "NativeThread")
