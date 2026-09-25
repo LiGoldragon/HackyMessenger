@@ -333,18 +333,22 @@
     (throw (ex-info (str "Held.{ " flow " " (name reason) " attempt-" (subs (:id attempt) 0 12) " }")
                     {:hm/failure true :hm/held true}))))
 (defn register! [flow name session native-thread readiness-marker rollout]
-  (flow-id! flow) (native-thread! native-thread)
-  (nonempty-strings! "Register requires a nonempty agent name and session" [name session])
+  (flow-id! flow)
   (with-reservation flow
     (fn []
       (assert-not-retired! flow)
-      (assert-native-not-retired! native-thread flow)
       (let [existing (when (fs/exists? (path flow)) (read-route flow))]
         (when (:route_hold existing) (fail "Registration is held for route repair"))
-        (let [agents (:agents (herdr! "--session" session "agent" "list"))
+        (let [agents (if session (:agents (herdr! "--session" session "agent" "list")) (live-agents))
               found (filter #(= name (:name %)) agents)]
           (when-not (= 1 (count found)) (fail (str "Expected one live agent named " name "; found " (count found) ". Use --session.")))
-          (let [a (assoc (first found) :session session)
+          (let [a (assoc (first found) :session (or session (:session (first found))))
+                session (:session a)
+                observed (herdr! "--session" session "pane" "process-info" "--pane" (:pane_id a))
+                native-thread (or native-thread (:native_thread existing)
+                                  (second (re-find #"([A-Za-z0-9-]{16,96})" (pr-str observed))))
+                _ (native-thread! native-thread)
+                _ (assert-native-not-retired! native-thread flow)
                 _ (nonempty-strings! "Herdr registration has no agent kind" [(:agent a)])
                 proof (when-not (:interactive_ready a)
                         (if readiness-marker

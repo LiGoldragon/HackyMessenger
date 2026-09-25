@@ -56,7 +56,6 @@
                            marker (arg rest "--readiness-probe") rollout (arg rest "--rollout")]
                        (when-not (and flow name) (parse-error "the following arguments are required: flow, name"))
                        (unknown-flags! rest #{"--session" "--native-thread" "--readiness-probe" "--rollout"})
-                       (when-not (and session thread) (hm/fail "register requires --session and --native-thread in the Clojure proof"))
                        (println (hm/register! flow name session thread marker rollout)))
           "deregister" (let [[flow & rest] xs]
                          (when-not flow (parse-error "the following arguments are required: flow"))
