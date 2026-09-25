@@ -37,7 +37,11 @@
     (fail "Invalid DeliveryAttempt grade or reason"))
   (valid! DeliveryAttempt value "DeliveryAttempt"))
 (defprotocol Registry (load-route [this flow]) (save-route! [this flow route]))
-(defprotocol HerdrTransport (live-agents* [this]) (target-agent* [this route]) (prompt!* [this route envelope wait?]))
+(defprotocol HerdrTransport
+  (live-agents* [this])
+  (target-agent* [this route])
+  (process-info* [this route])
+  (prompt!* [this route envelope wait?]))
 (defprotocol Ledger (record-attempt! [this attempt]) (record-pending! [this attempt body]))
 (defprotocol Clock (current-time [this]))
 (defrecord SystemClock [] Clock (current-time [_] (.toString (java.time.Instant/now))))
@@ -48,8 +52,13 @@
 (def ^:dynamic *root* nil)
 (def ^:dynamic *flow-id* nil)
 (def ^:dynamic *ledger* nil)
+(def ^:dynamic *transport* nil)
+;; A test seam around the Orchestrate boundary.  Production always uses
+;; `with-reservation` below; tests supply a short-lived in-memory lease.
+(def ^:dynamic *with-reservation* nil)
 (defn root [] (fs/absolutize (or *root* (System/getenv "HM_REGISTRY") (str (fs/path (System/getProperty "user.home") ".local/state/hacky-messenger")))))
 (defn path [flow] (fs/path (root) (str (flow-id! flow) ".edn")))
+(defn retired-path [flow] (fs/path (root) "retired" (str (flow-id! flow) ".edn")))
 (defn now [] (current-time (->SystemClock)))
 (defn quote-datom [s] (str "«" (str/replace (str s) #"[\\»]" {\\ "\\\\" \» "\\»"}) "»"))
 (defn relay [sender recipient body]
@@ -78,17 +87,32 @@
     (when-not (zero? exit) (fail (or (not-empty (str/trim err)) (str "herdr failed: " exit))))
     (try (let [reply (json/parse-string out true)] (if (:error reply) (fail (str "Herdr: " (:error reply))) (or (:result reply) reply)))
          (catch Exception _ (fail "Herdr returned invalid JSON; do not blindly retry a send")))))
-(declare live-agents)
+(declare shell-live-agents)
 (defn direct-prompt! [route envelope wait-presented]
   (let [args (cond-> ["--session" (:session route) "agent" "prompt" (:pane_id route) envelope]
                wait-presented (into ["--wait" "--timeout" "5000"]))]
     (apply herdr! args)))
 (defrecord ShellHerdr []
   HerdrTransport
-  (live-agents* [_] (live-agents))
+  (live-agents* [_] (shell-live-agents))
   (target-agent* [_ route] (herdr! "--session" (:session route) "agent" "get" (:pane_id route)))
+  (process-info* [_ route] (herdr! "--session" (:session route) "pane" "process-info" "--pane" (:pane_id route)))
   (prompt!* [_ route envelope wait?] (direct-prompt! route envelope wait?)))
-(defn transport [] (->ShellHerdr))
+(defn transport [] (or *transport* (->ShellHerdr)))
+(defn assert-not-retired! [flow]
+  (let [marker (retired-path flow)]
+    (when (fs/exists? marker)
+      (try
+        (valid! RetirementMarker (edn/read-string (slurp (str marker))) "RetirementMarker")
+        (catch Exception _ (fail (str "Retirement marker for " flow " is unavailable or malformed"))))
+      (fail (str "Retired: " flow)))))
+(defn process-matches! [route]
+  (let [reply (process-info* (transport) route)
+        info (or (:process_info reply) reply)
+        processes (:foreground_processes info)
+        native (native-thread! (:native_thread route))]
+    (when-not (some #(str/includes? (str/join " " (map str (or (:argv %) []))) native) processes)
+      (fail "ProcessMismatch"))))
 (defn verify-target! [route]
   (let [reply (target-agent* (transport) route)
         agent (or (:agent reply) reply)]
@@ -97,14 +121,18 @@
                    (= (:terminal_id route) (:terminal_id agent))
                    (= (:agent route) (:agent agent)))
       (fail "IdentityChanged"))
-    (when-not (:interactive_ready agent) (fail "NotReady"))
+    (when (and (not (:interactive_ready agent))
+               (not= (:native_thread route) (get-in route [:readiness_proof :thread_id])))
+      (fail "NotReady"))
     (when (= "blocked" (:agent_status agent)) (fail "Blocked"))
+    (process-matches! route)
     agent))
-(defn live-agents []
+(defn shell-live-agents []
   (mapcat (fn [session]
             (map #(assoc % :session (:name session))
                  (:agents (herdr! "--session" (:name session) "agent" "list"))))
           (filter :running (:sessions (herdr! "session" "list" "--json")))))
+(defn live-agents [] (live-agents* (transport)))
 (defn parse-pane [value]
   (let [[session pane & extra] (str/split (or value "") #":" 3)]
     (when (or (str/blank? session) (str/blank? pane) (seq extra)) (fail "--pane requires <session>:<pane>"))
@@ -141,6 +169,24 @@
     (delivery-attempt! attempt)
     (fs/create-dirs (root))
     (record-attempt! (or *ledger* (->EdnLedger (root))) attempt)))
+(defn reserve! [flow]
+  (let [owner (flow-id! (or *flow-id* (System/getenv "FLOW_ID") flow))
+        reply (shell {:out :string :err :string :timeout 15000}
+                     "orchestrate"
+                     (str "Lock.{ HackyMessengerDelivery " owner " [ " (quote-datom (root)) " ] «Register or submit through Herdr» }"))
+        match (re-find #"Locked\.\{\s+(\d+)\b" (:out reply))]
+    (when-not (and (zero? (:exit reply)) match)
+      (fail (str "Reservation refused: " (str/trim (or (not-empty (:out reply)) (:err reply) "")))))
+    (valid! Reservation {:id (parse-long (second match)) :flow flow :root (str (root))} "Reservation")))
+(defn release! [reservation]
+  (let [reply (shell {:out :string :err :string :timeout 15000} "orchestrate" (str "Release." (:id reservation)))]
+    (when-not (and (zero? (:exit reply)) (str/starts-with? (:out reply) "Released."))
+      (fail (str "Reservation release failed: " (str/trim (or (not-empty (:out reply)) (:err reply) "")))))))
+(defn with-reservation [flow f]
+  (if *with-reservation*
+    (*with-reservation* flow f)
+    (let [reservation (reserve! flow)]
+      (try (f) (finally (release! reservation))))))
 (defrecord EdnLedger [state-root]
   Ledger
   (record-attempt! [_ attempt]
@@ -169,22 +215,27 @@
 (defn send! [flow body wait-presented pane]
   (valid! FlowId flow "FlowId") (valid! MessageBody body "MessageBody")
   (when (or (str/blank? body) (re-find #"[\p{Cc}&&[^\n\t]]" body)) (fail "Message must be nonempty and contain no terminal control characters"))
-  (let [sender (or *flow-id* (System/getenv "FLOW_ID") (fail "Set FLOW_ID to your own flow ID before sending"))
-        stored (try (read-route flow) (catch Exception _ nil))]
-    (let [[route fallback?] (try (resolve-send-route flow stored pane)
-                                 (catch Exception _
-                                   (held! flow (if stored :PaneMissing :NotRegistered) body stored)))]
-      (let [live (try (verify-target! route)
-                      (catch Exception _ (held! flow :IdentityChanged body route)))
-            envelope (relay sender flow body)
-            submission (append-attempt! flow :Submitting :Uncertain route)]
-        (try
-          (direct-prompt! route envelope wait-presented)
-          (let [grade (if fallback? :Fallback-Presented (if wait-presented :Presented :Transported))]
-            (append-attempt! flow :sent grade route)
-            (str (name grade) ".{ " flow " " (or (:agent_status live) "unknown") " }"))
-          (catch Exception error
-            (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } prompt failed or is uncertain: " (.getMessage error)))))))))
+  (let [sender (or *flow-id* (System/getenv "FLOW_ID") (fail "Set FLOW_ID to your own flow ID before sending"))]
+    (with-reservation flow
+      (fn []
+        ;; The lifecycle check and route resolution share the delivery lease.
+        (assert-not-retired! flow)
+        (let [stored (try (read-route flow) (catch Exception _ nil))]
+          (let [[route fallback?] (try (resolve-send-route flow stored pane)
+                                       (catch Exception _
+                                         (held! flow (if stored :PaneMissing :NotRegistered) body stored)))]
+            (let [live (try (verify-target! route)
+                            (catch Exception error
+                              (held! flow (keyword (or (.getMessage error) "IdentityChanged")) body route)))
+                  envelope (relay sender flow body)
+                  submission (append-attempt! flow :Submitting :Uncertain route)]
+              (try
+                (prompt!* (transport) route envelope wait-presented)
+                (let [grade (if fallback? :Fallback-Presented (if wait-presented :Presented :Transported))]
+                  (append-attempt! flow :sent grade route)
+                  (str (name grade) ".{ " flow " " (or (:agent_status live) "unknown") " }"))
+                (catch Exception error
+                  (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12) " } prompt failed or is uncertain: " (.getMessage error))))))))))))
 (defn listing! []
   (let [records (for [p (fs/glob (root) "*.edn")
                       :when (not= "attempts.edn" (str (fs/file-name p)))]

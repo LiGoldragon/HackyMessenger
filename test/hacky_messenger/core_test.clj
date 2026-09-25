@@ -9,6 +9,14 @@
 (def route {:session "s" :name "Mind Sol 00f95a" :pane_id "p" :terminal_id "t"
             :agent "codex" :native_thread "00000000-0000-0000-0000-000000000000"})
 
+(defn pass-reservation [_ f] (f))
+(defn fake-transport [live-agent target-agent processes prompts]
+  (reify hm/HerdrTransport
+    (live-agents* [_] [live-agent])
+    (target-agent* [_ _] {:agent target-agent})
+    (process-info* [_ _] {:process_info {:foreground_processes processes}})
+    (prompt!* [_ _ _ _] (swap! prompts inc) {:ok true})))
+
 (deftest identifiers-and-title-fallback-are-strict
   (is (false? (malli.core/validate hm/FlowId "../../etc/x")))
   (is (thrown? Exception (hm/path "../../etc/x")))
@@ -38,7 +46,7 @@
 (deftest held-unregistered-writes-edn-and-datalog-pending-without-prompt
   (let [root (str (fs/create-temp-dir {:prefix "hm-held-"}))
         prompted (atom false)]
-    (binding [hm/*root* root hm/*flow-id* "sender"]
+    (binding [hm/*root* root hm/*flow-id* "sender" hm/*with-reservation* pass-reservation]
       (with-redefs [hm/live-agents (constantly [])
                     hm/verify-target! (fn [_] route)
                     hm/direct-prompt! (fn [& _] (reset! prompted true))]
@@ -62,7 +70,7 @@
 
 (deftest stale-route-is-fallback-presented-and-prompt-failure-is-not-retried
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-send-"}))]
-    (binding [hm/*root* root-path hm/*flow-id* "sender"]
+    (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation]
       (hm/atomic-edn! (hm/path "00f95a") route)
       (with-redefs [hm/live-agents (constantly [(assoc route :pane_id "moved")])
                     hm/verify-target! (fn [_] route)
@@ -84,7 +92,7 @@
         failing (reify hm/Ledger
                   (record-attempt! [_ _] (hm/fail "ledger unavailable"))
                   (record-pending! [_ _ _] nil))]
-    (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*ledger* failing]
+    (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*ledger* failing hm/*with-reservation* pass-reservation]
       (hm/atomic-edn! (hm/path "00f95a") route)
       (with-redefs [hm/live-agents (constantly [route])
                     hm/verify-target! (fn [_] route)
@@ -93,3 +101,32 @@
                      (try (hm/send! "00f95a" "body" false nil)
                           (catch Exception error (.getMessage error)))))
         (is (zero? @prompts))))))
+
+(deftest route-gates-precede-the-prompt
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-route-gates-"}))
+        prompts (atom 0)
+        good-agent (assoc route :interactive_ready true :agent_status "working")
+        good-process [{:argv ["codex" "--thread" (:native_thread route)]}]
+        send-result (fn [target-agent processes]
+                      (binding [hm/*root* root-path hm/*flow-id* "sender"
+                                hm/*with-reservation* pass-reservation
+                                hm/*transport* (fake-transport good-agent target-agent processes prompts)]
+                        (hm/atomic-edn! (hm/path "00f95a") route)
+                        (try (hm/send! "00f95a" "body" false nil)
+                             (catch Exception error (.getMessage error)))))]
+    (is (re-find #"IdentityChanged" (send-result (assoc good-agent :agent "other") good-process)))
+    (is (re-find #"NotReady" (send-result (assoc good-agent :interactive_ready false) good-process)))
+    (is (re-find #"ProcessMismatch" (send-result good-agent [{:argv ["codex" "--thread" "different"]}])))
+    (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation]
+      (hm/atomic-edn! (hm/retired-path "00f95a") {:flow "00f95a" :record route :native_thread (:native_thread route)})
+      (is (re-find #"Retired" (try (hm/send! "00f95a" "body" false nil)
+                                   (catch Exception error (.getMessage error)))))
+      (fs/delete (hm/retired-path "00f95a")))
+    (binding [hm/*root* root-path hm/*flow-id* "sender"
+              hm/*with-reservation* (fn [_ _] (hm/fail "Reservation refused"))
+              hm/*transport* (fake-transport good-agent good-agent good-process prompts)]
+      (is (re-find #"Reservation refused" (try (hm/send! "00f95a" "body" false nil)
+                                               (catch Exception error (.getMessage error))))))
+    (is (zero? @prompts))
+    (is (= "Transported.{ 00f95a working }" (send-result good-agent good-process)))
+    (is (= 1 @prompts))))
