@@ -24,7 +24,7 @@
 
 (defn fail [s] (throw (ex-info s {:hm/failure true})))
 (defn valid! [schema value label] (if (m/validate schema value) value (fail (str "Invalid " label ": " (pr-str (m/explain schema value))))))
-(declare atomic-edn!)
+(declare atomic-edn! ->EdnLedger record-attempt!)
 (defn flow-id! [value]
   (when-not (and (string? value) (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" value)) (fail "Invalid FlowId"))
   (valid! FlowId value "FlowId"))
@@ -77,12 +77,19 @@
     (when-not (zero? exit) (fail (or (not-empty (str/trim err)) (str "herdr failed: " exit))))
     (try (let [reply (json/parse-string out true)] (if (:error reply) (fail (str "Herdr: " (:error reply))) (or (:result reply) reply)))
          (catch Exception _ (fail "Herdr returned invalid JSON; do not blindly retry a send")))))
+(declare live-agents)
 (defn direct-prompt! [route envelope wait-presented]
   (let [args (cond-> ["--session" (:session route) "agent" "prompt" (:pane_id route) envelope]
                wait-presented (into ["--wait" "--timeout" "5000"]))]
     (apply herdr! args)))
+(defrecord ShellHerdr []
+  HerdrTransport
+  (live-agents* [_] (live-agents))
+  (target-agent* [_ route] (herdr! "--session" (:session route) "agent" "get" (:pane_id route)))
+  (prompt!* [_ route envelope wait?] (direct-prompt! route envelope wait?)))
+(defn transport [] (->ShellHerdr))
 (defn verify-target! [route]
-  (let [reply (herdr! "--session" (:session route) "agent" "get" (:pane_id route))
+  (let [reply (target-agent* (transport) route)
         agent (or (:agent reply) reply)]
     (when-not (and (= (:name route) (:name agent))
                    (= (:pane_id route) (:pane_id agent))
@@ -132,8 +139,15 @@
                   route (assoc :binding route))]
     (delivery-attempt! attempt)
     (fs/create-dirs (root))
-    (spit (str (fs/path (root) "attempts.edn")) (str (pr-str attempt) "\n") :append true)
-    (store/index-attempt! (root) attempt)
+    (record-attempt! (->EdnLedger (root)) attempt)))
+(defrecord EdnLedger [state-root]
+  Ledger
+  (record-attempt! [_ attempt]
+    (spit (str (fs/path state-root "attempts.edn")) (str (pr-str attempt) "\n") :append true)
+    (store/index-attempt! state-root attempt)
+    attempt)
+  (record-pending! [_ attempt body]
+    (store/index-pending! state-root attempt body)
     attempt))
 (defn held! [flow reason body route]
   (let [attempt (append-attempt! flow reason :Held route)
