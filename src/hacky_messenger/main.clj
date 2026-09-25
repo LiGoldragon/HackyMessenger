@@ -1,9 +1,10 @@
 (ns hacky-messenger.main
-  (:require [hacky-messenger.core :as hm]))
-(defn usage [] (str "Usage: hm-clj <send|send-abrupt|register|deregister|rebind|move|retire|import-retirement|list> ...\n" hm/skill-note))
+  (:require [hacky-messenger.core :as hm]
+            [hacky-messenger.legacy-import :as legacy]))
+(defn usage [] (str "Usage: hm-clj <send|send-abrupt|register|deregister|rebind|move|retire|import-retirement|import-json|list> ...\n" hm/skill-note))
 (defn arg [xs option] (second (drop-while #(not= option %) xs)))
 (defn parse-error [message] (throw (ex-info message {:hm/parse true})))
-(def value-options #{"--session" "--native-thread" "--readiness-probe" "--rollout" "--old-name" "--pane-id" "--terminal-id" "--name" "--agent" "--process-pid" "--evidence" "--evidence-sha256" "--hold-seconds" "--pane"})
+(def value-options #{"--session" "--native-thread" "--readiness-probe" "--rollout" "--old-name" "--pane-id" "--terminal-id" "--name" "--agent" "--process-pid" "--evidence" "--evidence-sha256" "--hold-seconds" "--pane" "--target" "--receipt"})
 (defn expand-equals [xs]
   (mapcat #(if-let [[_ option value] (re-matches #"(--[^=]+)=(.*)" %)] [option value] [%]) xs))
 (defn normalize-options [xs]
@@ -11,7 +12,7 @@
     (loop [remaining xs positional [] options []]
       (if-let [value (first remaining)]
         (cond
-          (= value "--wait-presented") (recur (next remaining) positional (conj options value))
+          (contains? #{"--wait-presented" "--apply"} value) (recur (next remaining) positional (conj options value))
           (contains? value-options value) (if-let [argument (second remaining)]
                                             (recur (nnext remaining) positional (into options [value argument]))
                                             (parse-error (str "argument " value ": expected one argument")))
@@ -22,7 +23,7 @@
   (loop [remaining xs]
     (when-let [value (first remaining)]
       (cond
-        (= value "--wait-presented") (recur (next remaining))
+        (contains? #{"--wait-presented" "--apply"} value) (recur (next remaining))
         (contains? value-options value) (recur (nnext remaining))
         (contains? allowed value) (recur (next remaining))
         :else (parse-error (str "unrecognized arguments: " value))))))
@@ -95,6 +96,15 @@
                                              (when-not (every? some? [session pane-id terminal-id name agent native-thread evidence digest])
                                                (parse-error "the following arguments are required: --session, --pane-id, --terminal-id, --name, --agent, --native-thread, --evidence, --evidence-sha256"))
                                              (println (hm/retire! flow session pane-id terminal-id name agent native-thread evidence digest (= op "import-retirement")))))
+          "import-json" (let [[source & rest] xs]
+                          (when-not source (parse-error "the following arguments are required: source"))
+                          (unknown-flags! rest #{"--target" "--receipt" "--apply"})
+                          (extra-values! rest #{"--target" "--receipt" "--apply"})
+                          (let [target (arg rest "--target") receipt (arg rest "--receipt")]
+                            (when-not (and target receipt)
+                              (parse-error "the following arguments are required: --target, --receipt"))
+                            (println (legacy/import-json! source target receipt
+                                                          (boolean (some #{"--apply"} rest))))))
           "list" (do (when (seq xs) (parse-error "unrecognized arguments")) (println (hm/listing!)))
           (parse-error (str "invalid choice: " op)))))
     (catch clojure.lang.ExceptionInfo e

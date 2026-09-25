@@ -5,6 +5,7 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [hacky-messenger.core :as hm]
+            [hacky-messenger.legacy-import-test :as legacy-test]
             [hacky-messenger.typed-store :as store]))
 
 (def native-thread "00000000-0000-0000-0000-000000000000")
@@ -12,6 +13,19 @@
 (defn invoke [environment wrapper & arguments]
   (apply shell {:out :string :err :string :continue true :extra-env environment}
          (str (fs/absolutize (fs/path "bin" wrapper))) arguments))
+
+(deftest public-json-import-wrapper-is-dry-run-by-default-and-requires-apply
+  (let [{:keys [source]} (legacy-test/fixture!)
+        target (str (fs/path (fs/create-temp-dir {:prefix "hm-cli-import-target-"}) "target"))
+        receipt (str (fs/path (fs/create-temp-dir {:prefix "hm-cli-import-receipt-"}) "receipt.edn"))
+        dry-run (invoke {} "hm-clj-import-json" source "--target" target "--receipt" receipt)]
+    (is (zero? (:exit dry-run)) (:err dry-run))
+    (is (= :dry-run (:mode (edn/read-string (str/trim (:out dry-run))))))
+    (is (not (fs/exists? (store/database-path target))))
+    (let [applied (invoke {} "hm-clj-import-json" source "--target" target "--receipt" receipt "--apply")]
+      (is (zero? (:exit applied)) (:err applied))
+      (is (= :applied (:mode (edn/read-string (str/trim (:out applied))))))
+      (is (= "NeedsBinding" (:state (store/route-for target "beta")))))))
 
 (deftest public-wrappers-use-one-isolated-typed-database
   (let [root (str (fs/create-temp-dir {:prefix "hm-cli-store-"}))

@@ -37,7 +37,7 @@
    [:state {:optional true} :string]])
 (def Attempt
   [:map {:closed true}
-   [:id :string] [:flow :string] [:at :string] [:grade :keyword] [:reason :keyword]
+   [:id :string] [:flow :string] [:at :string] [:grade {:optional true} :keyword] [:reason :keyword]
    [:body {:optional true} :string] [:binding {:optional true} AttemptBinding]])
 (def Pending
   [:map {:closed true}
@@ -260,8 +260,8 @@
   (let [attempt (attempt! attempt)]
     [{:flow/id (:flow attempt)}
      (cond-> {:attempt/id (:id attempt) :attempt/flow [:flow/id (:flow attempt)]
-              :attempt/at (:at attempt) :attempt/grade (:grade attempt)
-              :attempt/reason (:reason attempt)}
+              :attempt/at (:at attempt) :attempt/reason (:reason attempt)}
+       (:grade attempt) (assoc :attempt/grade (:grade attempt))
        (:body attempt) (assoc :attempt/body (:body attempt))
        (:binding attempt) (merge (binding-attrs (:binding attempt))))]))
 (defn put-attempt! [root attempt]
@@ -272,7 +272,8 @@
       (throw (ex-info "Malformed attempt flow reference" {:entity entity})))
     (attempt!
      (cond-> {:id (:attempt/id entity) :flow flow :at (:attempt/at entity)
-              :grade (:attempt/grade entity) :reason (:attempt/reason entity)}
+              :reason (:attempt/reason entity)}
+       (:attempt/grade entity) (assoc :grade (:attempt/grade entity))
        (:attempt/body entity) (assoc :body (:attempt/body entity))
        (some #(contains? entity %)
              [:attempt.binding/session :attempt.binding/name :attempt.binding/pane
@@ -315,7 +316,7 @@
         (query root '[:find (pull ?pending ?pattern)
                       :in $ ?flow ?pattern
                       :where [?f :flow/id ?flow] [?attempt :attempt/flow ?f]
-                             [?pending :pending/attempt ?attempt]]
+                      [?pending :pending/attempt ?attempt]]
                flow pending-pull)
         1)
        (map (comp pulled-pending! first)) (sort-by #(get-in % [:attempt :id])) vec))
