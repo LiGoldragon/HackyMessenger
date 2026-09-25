@@ -178,7 +178,7 @@
                            {:exit 0 :out (str "Locked.{ " (swap! next-id inc)
                                               " " operation " sender [ /tmp ] test }\n") :err ""}
                            (do (deliver conflict-seen true)
-                               {:exit 1 :out "LockRejected.PathConflict.{ busy }\n" :err ""})))
+                               {:exit 1 :out "LockRejected.PathOverlap.{ busy }\n" :err ""})))
                        (do (reset! active false)
                            {:exit 0 :out "Released.{ 1 }\n" :err ""})))
         send-one (fn [body]
@@ -215,7 +215,7 @@
     (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*transport* transport
               hm/*reservation-wait-ms* 0 hm/*reservation-retry-ms* 0]
       (binding [hm/*shell* (fn [& _]
-                            {:exit 1 :out "LockRejected.PathConflict.{ busy }\n" :err ""})]
+                            {:exit 1 :out "LockRejected.PathOverlap.{ busy }\n" :err ""})]
         (is (re-find #"Reservation timed out after 0ms"
                      (try (hm/send! "00f95a" "held" false nil 0)
                           (catch Exception error (.getMessage error)))))))

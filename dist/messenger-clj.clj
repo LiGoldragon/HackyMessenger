@@ -5153,7 +5153,7 @@
   ;; if storage is unavailable while recording this post-submit observation.
   (try (append-attempt! flow :Uncertain :Uncertain route body) (catch Exception _ nil)))
 (defn contention? [reply]
-  (boolean (re-find #"LockRejected\.(?:DuplicateName|PathConflict)|(?:DuplicateName|PathConflict)"
+  (boolean (re-find #"LockRejected\.(?:DuplicateName|PathConflict|PathOverlap)|(?:DuplicateName|PathConflict|PathOverlap)"
                     (str (:out reply) "\n" (:err reply)))))
 (defn reserve! [flow]
   (let [owner (flow-id! (or *flow-id* (System/getenv "FLOW_ID") flow))
