@@ -8,6 +8,7 @@ case "$(basename "$0")" in
   hm-send-abrupt) set -- send-abrupt "$@" ;;
   hm-list) set -- list "$@" ;;
   hm-register) set -- register "$@" ;;
+  hm-repair) set -- repair "$@" ;;
   hm-deregister) set -- deregister "$@" ;;
   hm-rebind) set -- rebind "$@" ;;
   hm-move) set -- move "$@" ;;

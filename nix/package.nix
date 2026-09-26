@@ -21,6 +21,7 @@ stdenvNoCC.mkDerivation {
     "$out/bin/messenger-clj" --help > help
     grep -F 'Usage: messenger-clj' help
     test "$(readlink "$out/bin/hm-send")" = messenger-clj
+    "$out/bin/hm-repair" --help | grep -F 'repair'
     ! grep -R 'python\|hm.py' "$out/bin"
   '';
   meta = { description = "Typed Clojure CLI messenger with hm-* compatibility commands"; license = lib.licenses.epl20; platforms = [ "x86_64-linux" ]; mainProgram = "messenger-clj"; };
