@@ -9,10 +9,10 @@
             [malli.core :as m]))
 
 (def skill-note "Documented by the authored messaging skills in Curriculum. Update those sources with any change to this tool.")
-(def failure-reasons #{:NotRegistered :NeedsBinding :InTransition :RouteHold :IdentityChanged :PaneMissing :NotReady :Blocked :ProcessMismatch :Stalled :Uncertain :RelayOverflow :Submitting :InvalidBinding :sent})
-(def delivery-grades #{:Transported :Presented :Fallback-Presented :Held :Uncertain})
+(def failure-reasons #{:NotRegistered :NeedsBinding :InTransition :RouteHold :IdentityChanged :PaneMissing :NotReady :Blocked :ProcessMismatch :Stalled :Uncertain :RelayOverflow :Submitting :RepairCandidate :RepairRequired :RouteRepaired :InvalidBinding :sent})
+(def delivery-grades #{:Transported :Presented :Fallback-Presented :Repaired :Held :Uncertain})
 (def FlowId [:and [:string {:min 1 :max 96}] [:re #"^[A-Za-z0-9][A-Za-z0-9_-]*$"]])
-(def NativeThread [:and [:string {:min 16 :max 96}] [:re #"^[A-Za-z0-9-]+$"]])
+(def NativeThread [:and [:string {:min 16 :max 96}] [:re #"^[A-Za-z0-9][A-Za-z0-9-]+$"]])
 (def MessageBody [:string {:min 1}])
 (def MessageVariant [:enum :msg :psyche])
 (def ReadinessProof [:map {:closed true} [:thread_id NativeThread] [:rollout :string] [:marker :string] [:evidence_kind {:optional true} :string]])
@@ -34,14 +34,38 @@
     value
     (throw (ex-info (str "Invalid " label ": " (pr-str (m/explain schema value)))
                     {:hm/failure true :hm/invalid true}))))
-(declare ->DatalevinLedger record-attempt! record-pending! route-records nonempty-strings!)
+(declare ->DatalevinLedger record-attempt! record-pending! route-records nonempty-strings! record-sent! held!)
 (defn flow-id! [value]
   (when-not (and (string? value) (re-matches #"[A-Za-z0-9][A-Za-z0-9_-]{0,95}" value))
     (fail "Flow ID must contain only letters, digits, underscores, or hyphens"))
   (valid! FlowId value "FlowId"))
 (defn native-thread! [value]
-  (when-not (and (string? value) (re-matches #"[A-Za-z0-9-]{16,96}" value)) (fail "Invalid NativeThread"))
+  (when-not (and (string? value) (re-matches #"[A-Za-z0-9][A-Za-z0-9-]{15,95}" value)) (fail "Invalid NativeThread"))
   (valid! NativeThread value "NativeThread"))
+(defn registration-native-thread! [agent explicit-native existing-native]
+  (let [session (:agent_session agent)]
+    (if (nil? session)
+      (let [native (or explicit-native
+                       (fail "Herdr agent has no official agent_session; --native-thread is required"))]
+        (native-thread! native)
+        (when (and existing-native (not= existing-native native))
+          (fail "Explicit native thread differs from the existing registration"))
+        native)
+      (let [{session-agent :agent kind :kind source :source value :value} session
+            agent-kind (:agent agent)]
+        (when-not (and (map? session)
+                       (= #{:agent :kind :source :value} (set (keys session)))
+                       (string? agent-kind)
+                       (= agent-kind session-agent)
+                       (= "id" kind)
+                       (= (str "herdr:" agent-kind) source))
+          (fail "Herdr agent_session is malformed or does not match the agent"))
+        (native-thread! value)
+        (when (and explicit-native (not= explicit-native value))
+          (fail "Explicit native thread differs from Herdr agent_session"))
+        (when (and existing-native (not= existing-native value))
+          (fail "Herdr agent_session differs from the existing registration"))
+        value))))
 (defn route-binding! [value]
   (try
     (valid! RouteBinding (store/route! value) "RouteBinding")
@@ -210,17 +234,12 @@
            (= native (:sessionId value)))
          (catch Exception _ false))))
 (defn process-matches! [route]
-  ;; A fallback route without a stored native thread has no native identity to
-  ;; compare.  Exact Herdr pane identity and readiness remain mandatory.
-  (when-let [native-value (:native_thread route)]
-    (let [reply (process-info* (transport) route)
-          info (or (:process_info reply) reply)
-          processes (:foreground_processes info)
-          native (native-thread! native-value)]
-      (when-not (some #(or (str/includes? (str/join " " (map str (or (:argv %) []))) native)
-                           (and (= "claude" (:agent route)) (claude-session-matches? % native)))
-                      processes)
-        (fail "ProcessMismatch")))))
+  ;; Native identity comes from Herdr's typed agent_session.  Native-less
+  ;; fallback routes retain their existing exact pane/terminal checks.
+  (when (:native_thread route)
+    (let [reply (target-agent* (transport) route)
+          agent (assoc (or (:agent reply) reply) :session (:session route))]
+      (registration-native-thread! agent (:native_thread route) nil))))
 (defn content-text [content]
   (cond
     (string? content) content
@@ -356,6 +375,42 @@
       (when-not (= attempt (store/attempt-by-id (root) (:id attempt)))
         (fail "Attempt ledger index did not confirm persistence")))
     attempt))
+(def exact-agent-keys [:session :name :pane_id :terminal_id :agent])
+(defn checked-repair-candidate [listed]
+  (try
+    (let [reply (target-agent* (transport) listed)
+          target (assoc (or (:agent reply) reply) :session (:session listed))]
+      (when (= (select-keys listed exact-agent-keys)
+               (select-keys target exact-agent-keys))
+        (let [native (registration-native-thread! target nil nil)]
+          (valid! RouteBinding
+                  (assoc (select-keys target exact-agent-keys) :native_thread native)
+                  "RouteBinding"))))
+    (catch Exception _ nil)))
+(defn discover-repair-candidates [flow stored pane]
+  (let [agents (live-agents)
+        suffix (re-pattern (str "(?:^|\\s)" (java.util.regex.Pattern/quote flow) "$"))
+        eligible (cond
+                   pane (let [{:keys [session pane_id]} (parse-pane pane)]
+                          (filter #(and (= session (:session %)) (= pane_id (:pane_id %))) agents))
+                   stored (filter #(or (same-stable-route? stored %)
+                                       (re-find suffix (or (:name %) ""))) agents)
+                   :else (filter #(re-find suffix (or (:name %) "")) agents))]
+    (->> eligible
+         (keep checked-repair-candidate)
+         (distinct)
+         vec)))
+(defn hold-repair-required! [flow stored pane request]
+  (let [candidates (discover-repair-candidates flow stored pane)]
+    (doseq [candidate candidates]
+      (append-attempt! flow :RepairCandidate :Repaired candidate nil nil))
+    (try
+      (held! flow :RepairRequired request (when (m/validate RouteBinding stored) stored))
+      (catch clojure.lang.ExceptionInfo error
+        (let [pending-id (:hm/attempt-id (ex-data error))
+              evidence (mapv #(select-keys % exact-agent-keys) candidates)]
+          (throw (ex-info (str "Held.{ " flow " RepairRequired " pending-id " } candidates=" (pr-str evidence))
+                          (ex-data error) error)))))))
 (defn held-reason [error]
   (let [message (.getMessage error)
         invalid? (:hm/invalid (ex-data error))
@@ -421,7 +476,11 @@
 (defn held! [flow reason request route]
   (let [route (when (and route (m/validate RouteBinding route)) route)
         {:keys [variant context body]} (request! request)
-        attempt (append-attempt! flow reason :Held route request nil)
+        repair-envelope (when (= reason :RepairRequired)
+                          (message-envelope (or *flow-id* (System/getenv "FLOW_ID")
+                                                (fail "Set FLOW_ID before holding a repair"))
+                                            request))
+        attempt (append-attempt! flow reason :Held route request repair-envelope)
         pending (valid! PendingIntent
                         (cond-> {:attempt attempt :message body :variant variant :state "held"}
                           (contains? request :context) (assoc :context context))
@@ -431,7 +490,7 @@
       (when-not (= pending (store/pending-by-id (root) (:id attempt)))
         (fail "Pending ledger index did not confirm persistence")))
     (throw (ex-info (str "Held.{ " flow " " (name reason) " attempt-" (subs (:id attempt) 0 12) " }")
-                    {:hm/failure true :hm/held true}))))
+                    {:hm/failure true :hm/held true :hm/attempt-id (:id attempt)}))))
 (defn register! [flow name session native-thread readiness-marker rollout]
   (flow-id! flow)
   (with-reservation flow
@@ -455,10 +514,7 @@
                     (fail "Herdr agent identity changed during registration"))
                 a target
                 session (:session a)
-                observed (herdr! "--session" session "pane" "process-info" "--pane" (:pane_id a))
-                native-thread (or native-thread (:native_thread existing)
-                                  (second (re-find #"([A-Za-z0-9-]{16,96})" (pr-str observed))))
-                _ (native-thread! native-thread)
+                native-thread (registration-native-thread! a native-thread (:native_thread existing))
                 _ (assert-native-not-retired! native-thread flow)
                 _ (nonempty-strings! "Herdr registration has no agent kind" [(:agent a)])
                 proof (when-not (:interactive_ready a)
@@ -474,6 +530,62 @@
               (fail "Live route identity is already registered to another Flow"))
             (save-route! (registry) flow route)
             (str "Registered " flow ": " (:name route) " (" session ")")))))))
+(defn repair! [flow pending-id session pane-id terminal-id name agent-kind]
+  (flow-id! flow)
+  (nonempty-strings! "Repair requires pending ID and every exact candidate identity field"
+                     [pending-id session pane-id terminal-id name agent-kind])
+  (with-reservation flow
+    (fn []
+      (assert-not-retired! flow)
+      (let [pending (store/pending-by-id (root) pending-id)]
+        (when-not (and pending (= flow (get-in pending [:attempt :flow]))
+                       (= :RepairRequired (get-in pending [:attempt :reason])))
+          (fail "Repair pending intent is absent, already submitted, or belongs to another Flow"))
+        (let [existing (load-route (registry) flow)]
+          (when (:route_hold existing) (fail "RouteHold"))
+          (when (in-transition? existing) (fail "InTransition")))
+        (let [expected {:session session :pane_id pane-id :terminal_id terminal-id
+                        :name name :agent agent-kind}
+              hits (filter #(= expected (select-keys % exact-agent-keys)) (live-agents))]
+          (when-not (= 1 (count hits))
+            (fail (if (empty? hits) "Repair candidate is no longer live and exact"
+                      "Repair candidate is ambiguous")))
+          (let [route (or (checked-repair-candidate (first hits))
+                          (fail "Repair candidate identity or official agent_session changed"))
+                _ (assert-native-not-retired! (:native_thread route) flow)
+                _ (when (some #(and (not= flow (key %)) (same-stable-route? route (val %)))
+                              (route-records))
+                    (fail "Live route identity is already registered to another Flow"))
+                request (request! (cond-> {:variant (or (:variant pending) :msg)
+                                           :body (:message pending)}
+                                    (= :psyche (:variant pending)) (assoc :context (:context pending))))
+                envelope (get-in pending [:attempt :submitted])
+                parsed (when (string? envelope)
+                         (if (= :psyche (:variant request))
+                           (let [[_ context body] (read-psyche-message envelope)]
+                             {:variant :psyche :context context :body body})
+                           (let [[_ body] (read-pane-message envelope)]
+                             {:variant :msg :body body})))
+                _ (when-not (= (select-keys request [:variant :context :body]) parsed)
+                    (fail "Repair pending envelope is missing or differs from the held message"))
+                repair-attempt (delivery-attempt!
+                                {:id (str (java.util.UUID/randomUUID)) :at (now) :flow flow
+                                 :reason :RouteRepaired :grade :Repaired :binding route})
+                _ (store/put-route-and-attempt! (root) flow route repair-attempt)
+                submission (delivery-attempt!
+                            (merge {:id (str (java.util.UUID/randomUUID)) :at (now) :flow flow
+                                    :reason :Submitting :grade :Uncertain :binding route}
+                                   (attempt-fields request envelope)))
+                _ (store/take-pending-with-attempt! (root) pending-id submission)]
+            (try
+              (let [reply (prompt!* (transport) route envelope false)]
+                (verify-target! route)
+                (record-sent! flow :Transported route submission
+                              (or (:agent reply) reply) request envelope))
+              (catch Exception error
+                (record-uncertain! flow route request envelope)
+                (fail (str "Uncertain.{ " flow " attempt-" (subs (:id submission) 0 12)
+                           " } repair delivery failed or is uncertain; do not retry: " (.getMessage error)))))))))))
 (defn nonempty-strings! [label fields]
   (when-not (every? #(and (string? %) (not (str/blank? %))) fields)
     (fail label)))
@@ -699,21 +811,20 @@
      (with-reservation flow
        (fn []
          (assert-not-retired! flow)
-         (let [stored (try (read-route flow) (catch Exception _ nil))
-               stored (if (and (nil? stored) (pos? hold-seconds))
-                        (do (Thread/sleep (long (* 1000 hold-seconds)))
-                            (try (read-route flow) (catch Exception _ nil)))
-                        stored)]
-           (when (in-transition? stored) (held! flow :InTransition request stored))
-           (when (needs-binding? stored) (held! flow :NeedsBinding request stored))
-           (when (:route_hold stored) (held! flow :RouteHold request stored))
-           (let [[route fallback?] (try (resolve-send-route flow stored pane)
-                                        (catch Exception error
-                                          (held! flow (cond (:hm/invalid (ex-data error)) :InvalidBinding
-                                                            stored :PaneMissing
-                                                            :else :NotRegistered)
-                                                 request stored)))
-                 live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) request route)))
+         (let [raw-stored (try (load-route (registry) flow) (catch Exception _ nil))
+               stored (try (when raw-stored (route-binding! raw-stored)) (catch Exception _ nil))]
+           (when (in-transition? raw-stored) (held! flow :InTransition request stored))
+           (when (:route_hold raw-stored) (held! flow :RouteHold request stored))
+           (when (or (nil? stored) (needs-binding? stored))
+             (hold-repair-required! flow raw-stored pane request))
+           (let [route (try (refresh-route-snapshot stored (exact-live-agent stored))
+                            (catch Exception _ (hold-repair-required! flow raw-stored pane request)))
+                 live (try (verify-target! route)
+                           (catch Exception error
+                             (let [reason (held-reason error)]
+                               (if (contains? #{:NotReady :Blocked :Uncertain} reason)
+                                 (held! flow reason request route)
+                                 (hold-repair-required! flow raw-stored pane request)))))
                  route (refresh-route-snapshot route live)
                  envelope (message-envelope sender request)
                  submission (try (append-attempt! flow :Submitting :Uncertain route request envelope)
@@ -721,9 +832,9 @@
                                    (if (:hm/invalid (ex-data error))
                                      (held! flow :InvalidBinding request route)
                                      (throw error))))
-                 grade (if fallback? :Fallback-Presented (if wait-presented :Presented :Transported))]
+                 grade (if wait-presented :Presented :Transported)]
              (try
-               (let [waited? (or fallback? wait-presented)
+               (let [waited? wait-presented
                      reply (prompt!* (transport) route envelope waited?)]
                  (when waited? (presented! route reply)))
                (verify-target! route)

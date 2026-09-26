@@ -20,7 +20,12 @@
 (defn fake-transport [live-agent target-agent processes prompts]
   (reify hm/HerdrTransport
     (live-agents* [_] [live-agent])
-    (target-agent* [_ _] {:agent target-agent})
+    (target-agent* [_ _]
+      {:agent (if (contains? target-agent :agent_session)
+                target-agent
+                (assoc target-agent :agent_session
+                       {:source (str "herdr:" (:agent target-agent)) :kind "id"
+                        :agent (:agent target-agent) :value (:native_thread route)}))})
     (process-info* [_ _] {:process_info {:foreground_processes processes}})
     (pane* [_ route] {:pane (select-keys route [:pane_id :terminal_id :agent])})
     (move-pane* [_ route _ _] {:move_result {:previous_pane_id (:pane_id route) :previous_workspace_id "w1"
@@ -111,7 +116,7 @@
         (let [diagnostic (try (hm/send-psyche! "00f95a" "context" verbatim false nil 0)
                               (catch Exception error (.getMessage error)))
               pending (first (store/pending-for root-path "00f95a"))]
-          (is (re-find #"Held\.\{ 00f95a NotRegistered" diagnostic))
+          (is (re-find #"Held\.\{ 00f95a RepairRequired" diagnostic))
           (is (= verbatim (:message pending)))
           (is (= "context" (:context pending)))
           (is (= :psyche (:variant pending)))
@@ -295,10 +300,10 @@
                     hm/direct-prompt! (fn [& _] (reset! prompted true))]
         (let [message (try (hm/send! "00f95a" "held body" false nil)
                            (catch Exception error (.getMessage error)))]
-          (is (re-find #"Held\.\{ 00f95a NotRegistered" message))
+          (is (re-find #"Held\.\{ 00f95a RepairRequired" message))
           (is (false? @prompted))
           (is (= 1 (count (store/pending-for root "00f95a"))))
-          (is (= :NotRegistered
+          (is (= :RepairRequired
                  (get-in (first (store/pending-for root "00f95a"))
                          [:attempt :reason]))))))))
 
@@ -312,9 +317,9 @@
                     hm/direct-prompt! (fn [& _] (reset! prompted true))]
         (let [message (try (hm/send! "00f95a" "held body" false nil 0)
                            (catch Exception error (.getMessage error)))]
-          (is (re-find #"Held\.\{ 00f95a NeedsBinding" message))
+          (is (re-find #"Held\.\{ 00f95a RepairRequired" message))
           (is (false? @prompted))
-          (is (= :NeedsBinding
+          (is (= :RepairRequired
                  (get-in (first (store/pending-for root-path "00f95a"))
                          [:attempt :reason]))))))))
 
@@ -327,37 +332,6 @@
     (is (thrown? Exception (hm/resolve-send-route "00f95a" route nil))))
   (with-redefs [hm/live-agents (constantly [(assoc route :session "override" :pane_id "chosen")])]
     (is (= "chosen" (:pane_id (first (hm/resolve-send-route "00f95a" nil "override:chosen")))))))
-
-(deftest fallback-presentation-requires-an-observed-wait-without-retry
-  (let [root-path (str (fs/create-temp-dir {:prefix "hm-send-"}))]
-    (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation]
-      (persist-route! root-path route)
-      (let [calls (atom [])]
-        (with-redefs [hm/live-agents (constantly [(assoc route :pane_id "moved")])
-                      hm/verify-target! (fn [_] route)
-                      hm/direct-prompt! (fn [& args]
-                                          (swap! calls conj args)
-                                          (prompted (assoc route :pane_id "moved")))]
-          (is (= "Fallback-Presented.{ 00f95a unknown }"
-                 (hm/send! "00f95a" "fallback" false "s:moved")))
-          (is (= 1 (count @calls)))
-          (is (true? (nth (first @calls) 2)))))
-      (let [calls (atom 0)]
-        (with-redefs [hm/live-agents (constantly [(assoc route :pane_id "moved")])
-                      hm/verify-target! (fn [_] route)
-                      hm/direct-prompt! (fn [& _] (swap! calls inc) {:ok true})]
-          (is (re-find #"Uncertain\.\{ 00f95a"
-                       (try (hm/send! "00f95a" "submission-only" false "s:moved")
-                            (catch Exception error (.getMessage error)))))
-          (is (= 1 @calls))))
-      (let [calls (atom 0)]
-        (with-redefs [hm/live-agents (constantly [(assoc route :pane_id "moved")])
-                      hm/verify-target! (fn [_] route)
-                      hm/direct-prompt! (fn [& _] (swap! calls inc) (hm/fail "wait timeout"))]
-          (is (re-find #"Uncertain\.\{ 00f95a"
-                       (try (hm/send! "00f95a" "timeout" false "s:moved")
-                            (catch Exception error (.getMessage error)))))
-          (is (= 1 @calls)))))))
 
 (deftest plain-wait-presented-needs-the-supported-observation
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-presented-"}))
@@ -387,11 +361,15 @@
       (is (= 1 (count calls))))))
 
 (defn herdr-agent [overrides]
-  (merge {:agent "claude" :agent_status "idle" :cwd "/home/li/primary"
-          :focused false :foreground_cwd "/home/li/primary" :interactive_ready true
-          :name "Mind Sol 00f95a" :pane_id "moved" :revision 7 :state_change_seq 42
-          :tab_id "w1:t3" :terminal_id "t" :workspace_id "w1"}
-         overrides))
+  (let [agent (merge {:agent "claude" :agent_status "idle" :cwd "/home/li/primary"
+                      :focused false :foreground_cwd "/home/li/primary" :interactive_ready true
+                      :name "Mind Sol 00f95a" :pane_id "moved" :revision 7 :state_change_seq 42
+                      :tab_id "w1:t3" :terminal_id "t" :workspace_id "w1"}
+                     overrides)]
+    (if (contains? overrides :agent_session)
+      agent
+      (assoc agent :agent_session {:source (str "herdr:" (:agent agent)) :kind "id"
+                                   :agent (:agent agent) :value (:native_thread route)}))))
 
 (defn fallback-transport [session agents argv prompts & {:keys [reply target]}]
   (reify hm/HerdrTransport
@@ -443,26 +421,57 @@
                    (persist-route! root-path route)
                    [(g1-send root-path transport "00f95a" "must stay held" false nil 0) @prompts]))]
     (let [[result prompts] (invoke {"p" (herdr-agent {:pane_id "p" :terminal_id "replacement" :agent "codex"})})]
-      (is (re-find #"Held\.\{ 00f95a PaneMissing" result))
+      (is (re-find #"Held\.\{ 00f95a RepairRequired" result))
       (is (empty? prompts)))
     (let [[result prompts] (invoke {"one" (herdr-agent {:pane_id "p" :agent "codex"})
                                     "two" (herdr-agent {:pane_id "p" :agent "codex"})})]
-      (is (re-find #"Held\.\{ 00f95a PaneMissing" result))
+      (is (re-find #"Held\.\{ 00f95a RepairRequired" result))
       (is (empty? prompts)))))
 
-(deftest g1-pane-fallback-has-no-fabricated-native-thread
-  (let [root-path (str (fs/create-temp-dir {:prefix "hm-g1-pane-"}))
+(deftest missing-row-is-held-for-judgment-then-repaired-and-delivered-once
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-send-repair-missing-"}))
         prompts (atom [])
-        live (herdr-agent {:pane_id "w9:p1" :name "disposable-g1"
-                           :terminal_id "term_d" :agent "codex"})
-        transport (fallback-transport "d" {"w9:p1" live} ["zsh"] prompts)]
-    (is (= "Fallback-Presented.{ 00f95a idle }"
-           (g1-send root-path transport "00f95a" "to a pane" false "d:w9:p1" 0)))
-    (is (= 1 (count @prompts)))
-    (let [sent (first (filter #(= :sent (:reason %))
-                              (store/attempts-for root-path "00f95a")))]
-      (is (= "Fallback" (get-in sent [:binding :state])))
-      (is (nil? (get-in sent [:binding :native_thread]))))))
+        live (herdr-agent {:pane_id "w17:p1" :name "Psyche Opus 00f95a"
+                           :terminal_id "term-live" :agent "claude"})
+        transport (fallback-transport "messaging-build" {"w17:p1" live}
+                                      ["claude" "--dangerously-skip-permissions"] prompts)]
+    (let [held (g1-send root-path transport "00f95a" "repair then send" false nil 0)
+          pending (first (store/pending-for root-path "00f95a"))
+          pending-id (get-in pending [:attempt :id])]
+      (is (re-find #"Held\.\{ 00f95a RepairRequired" held))
+      (is (empty? @prompts))
+      (is (= 1 (count (filter #(= :RepairCandidate (:reason %))
+                              (store/attempts-for root-path "00f95a")))))
+      (binding [hm/*root* root-path hm/*flow-id* "sender"
+                hm/*with-reservation* pass-reservation hm/*transport* transport]
+        (is (= "Transported.{ 00f95a idle }"
+               (hm/repair! "00f95a" pending-id "messaging-build" "w17:p1"
+                           "term-live" "Psyche Opus 00f95a" "claude")))
+        (is (thrown? Exception
+                     (hm/repair! "00f95a" pending-id "messaging-build" "w17:p1"
+                                 "term-live" "Psyche Opus 00f95a" "claude")))))
+    (is (= [{:pane "w17:p1" :envelope "#msg [\"sender\" \"repair then send\"]" :wait false}]
+           @prompts))
+    (let [stored (store/route-for root-path "00f95a")
+          attempts (store/attempts-for root-path "00f95a")]
+      (is (= "term-live" (:terminal_id stored)))
+      (is (= (:native_thread route) (:native_thread stored)))
+      (is (= 1 (count (filter #(= :RouteRepaired (:reason %)) attempts))))
+      (is (= 1 (count (filter #(= :sent (:reason %)) attempts)))))))
+
+(deftest malformed-native-thread-is-held-and-never-inferred-from-argv
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-send-repair-malformed-"}))
+        prompts (atom [])
+        malformed (assoc route :native_thread "--dangerously-skip-permissions")
+        live (herdr-agent {:pane_id "p" :name (:name route) :agent "codex"})
+        transport (fallback-transport "s" {"p" live}
+                                      ["codex" "--dangerously-skip-permissions"] prompts)]
+    (persist-route! root-path malformed)
+    (is (re-find #"Held\.\{ 00f95a RepairRequired"
+                 (g1-send root-path transport "00f95a" "first" false nil 0)))
+    (is (empty? @prompts))
+    (is (= "--dangerously-skip-permissions"
+           (:native_thread (store/route-for root-path "00f95a"))))))
 
 (deftest g1-invalid-fallback-is-held-durably-before-prompt
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-g1-invalid-"}))
@@ -470,13 +479,13 @@
         live (herdr-agent {:pane_id "w9:p1" :name nil})
         transport (fallback-transport "d" {"w9:p1" live} ["zsh"] prompts)
         result (g1-send root-path transport "00f95a" "secret body" false "d:w9:p1" 0)]
-    (is (re-find #"^Held\.\{ 00f95a InvalidBinding attempt-[0-9a-f-]{12} \}$" result))
+    (is (re-find #"^Held\.\{ 00f95a RepairRequired" result))
     (is (not (str/includes? result "secret body")))
     (is (empty? @prompts))
     (let [pending (store/pending-for root-path "00f95a")]
       (is (= 1 (count pending)))
       (is (= "secret body" (:message (first pending))))
-      (is (= :InvalidBinding (get-in (first pending) [:attempt :reason]))))))
+      (is (= :RepairRequired (get-in (first pending) [:attempt :reason]))))))
 
 (deftest g1-presented-wait-names-all-observable-states
   (let [calls (atom [])]
@@ -518,9 +527,13 @@
                         (persist-route! root-path route)
                         (try (hm/send! "00f95a" "body" false nil)
                              (catch Exception error (.getMessage error)))))]
-    (is (re-find #"IdentityChanged" (send-result (assoc good-agent :agent "other") good-process)))
+    (is (re-find #"RepairRequired" (send-result (assoc good-agent :agent "other") good-process)))
     (is (re-find #"NotReady" (send-result (assoc good-agent :interactive_ready false) good-process)))
-    (is (re-find #"ProcessMismatch" (send-result good-agent [{:argv ["codex" "--thread" "different"]}])))
+    (is (re-find #"RepairRequired"
+                 (send-result (assoc good-agent :agent_session
+                                     {:source "herdr:claude" :kind "id" :agent "codex"
+                                      :value (:native_thread route)})
+                              [{:argv ["codex" "--dangerously-skip-permissions"]}])))
     (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation]
       (with-redefs [store/retirement-for (fn [_ flow] (when (= flow "00f95a") {:malformed true}))]
         (is (re-find #"Retirement marker" (try (hm/send! "00f95a" "body" false nil)
@@ -637,6 +650,55 @@
         (is (= "Registered 00f95a: Mind Sol 00f95a (s)"
                (hm/register! "00f95a" (:name route) "s" (:native_thread route) marker transcript)))
         (is (= marker (get-in (hm/read-route "00f95a") [:readiness_proof :marker])))))))
+
+(deftest register-uses-only-the-official-herdr-agent-session
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-register-session-"}))
+        official (:native_thread route)
+        process [{:argv ["claude" "--dangerously-skip-permissions" "--model" "opus"]}]
+        agent (assoc route :agent "claude" :interactive_ready true
+                     :agent_session {:source "herdr:claude" :kind "id"
+                                     :agent "claude" :value official})]
+    (binding [hm/*root* root-path hm/*with-reservation* pass-reservation
+              hm/*transport* (fake-transport agent agent process (atom 0))]
+      (with-redefs [hm/herdr! (fn [& args]
+                                (if (some #{"list"} args)
+                                  {:agents [agent]}
+                                  (throw (ex-info "process-info must not be used for registration" {}))))]
+        (is (= "Registered 00f95a: Mind Sol 00f95a (s)"
+               (hm/register! "00f95a" (:name route) "s" nil nil nil)))
+        (is (= official (:native_thread (hm/read-route "00f95a"))))))))
+
+(deftest register-rejects-untrusted-or-conflicting-native-session-without-persistence
+  (doseq [[label agent explicit]
+          [["absent" (assoc route :interactive_ready true :agent_session nil) nil]
+           ["malformed-source"
+            (assoc route :interactive_ready true
+                   :agent_session {:source "herdr:claude" :kind "id"
+                                   :agent "codex" :value (:native_thread route)})
+            nil]
+           ["malformed-value"
+            (assoc route :interactive_ready true
+                   :agent_session {:source "herdr:codex" :kind "id"
+                                   :agent "codex" :value "--dangerously-skip-permissions"})
+            nil]
+           ["explicit-mismatch"
+            (assoc route :interactive_ready true
+                   :agent_session {:source "herdr:codex" :kind "id"
+                                   :agent "codex" :value (:native_thread route)})
+            "11111111-1111-1111-1111-111111111111"]]]
+    (let [root-path (str (fs/create-temp-dir {:prefix (str "hm-register-" label "-")}))]
+      (binding [hm/*root* root-path hm/*with-reservation* pass-reservation
+                hm/*transport* (fake-transport agent agent
+                                               [{:argv ["codex" "--dangerously-skip-permissions"]}]
+                                               (atom 0))]
+        (with-redefs [hm/herdr! (fn [& args]
+                                  (if (some #{"list"} args)
+                                    {:agents [agent]}
+                                    (throw (ex-info "unexpected Herdr call" {}))))]
+          (is (thrown? Exception
+                       (hm/register! "00f95a" (:name route) "s" explicit nil nil))
+              label)
+          (is (nil? (store/route-for root-path "00f95a")) label))))))
 
 (deftest register-refreshes-a-renamed-existing-live-identity
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-register-rename-"}))

@@ -223,7 +223,7 @@
    :retirement/evidence-path :retirement/evidence-sha256
    :retirement/retired-by :retirement/at {:retirement/flow [:flow/id]}])
 
-(defn put-route! [root flow route]
+(defn- route-tx [root flow route]
   (let [route (route! route)
         current (some-> (query root '[:find (pull ?route [*])
                                       :in $ ?flow
@@ -240,7 +240,10 @@
                                      (not= attribute :route/flow)
                                      (not (contains? replacement attribute)))]
                       [:db/retract entity-id attribute value])]
-    (transact! root (vec (concat retractions [{:flow/id flow} replacement])))
+    (vec (concat retractions [{:flow/id flow} replacement]))))
+(defn put-route! [root flow route]
+  (let [route (route! route)]
+    (transact! root (route-tx root flow route))
     route))
 (defn- pulled-route! [entity]
   (when-not (string? (get-in entity [:route/flow :flow/id]))
@@ -286,6 +289,10 @@
        (:binding attempt) (merge (binding-attrs (:binding attempt))))]))
 (defn put-attempt! [root attempt]
   (let [attempt (attempt! attempt)] (transact! root (attempt-tx attempt)) attempt))
+(defn put-route-and-attempt! [root flow route attempt]
+  (let [route (route! route) attempt (attempt! attempt)]
+    (transact! root (vec (concat (route-tx root flow route) (attempt-tx attempt))))
+    {:route route :attempt attempt}))
 (defn- pulled-attempt! [entity]
   (let [flow (get-in entity [:attempt/flow :flow/id])]
     (when-not (string? flow)
@@ -349,6 +356,14 @@
                         :in $ ?id ?pattern :where [?pending :pending/id ?id]]
                  id pending-pull)
           (one! "pending intent" id) pulled-pending!))
+(defn take-pending-with-attempt! [root id attempt]
+  (let [attempt (attempt! attempt)
+        pending-id (query root '[:find ?pending . :in $ ?id
+                                 :where [?pending :pending/id ?id]] id)]
+    (when-not pending-id
+      (throw (ex-info "Pending intent is absent or already submitted" {:pending/id id})))
+    (transact! root (vec (concat [[:db/retractEntity pending-id]] (attempt-tx attempt))))
+    attempt))
 (defn pending-for [root flow]
   (->> (checked-rows!
         (query root '[:find (pull ?pending ?pattern)

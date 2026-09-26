@@ -1,13 +1,13 @@
 (ns messenger-clj.main
   (:require [messenger-clj.core :as hm]
             [messenger-clj.legacy-import :as legacy]))
-(defn usage [] (str "Usage: messenger-clj <send|send-abrupt|register|deregister|rebind|move|retire|import-retirement|import-json|heartbeat-state|list> ...\n"
+(defn usage [] (str "Usage: messenger-clj <send|send-abrupt|register|repair|deregister|rebind|move|retire|import-retirement|import-json|heartbeat-state|list> ...\n"
                     "  messenger-clj send TARGET BODY [--wait-presented] [--hold-seconds N] [--pane SESSION:PANE]\n"
                     "  messenger-clj send TARGET --psyche CONTEXT VERBATIM [--wait-presented] [--hold-seconds N] [--pane SESSION:PANE]\n"
                     hm/skill-note))
 (defn arg [xs option] (second (drop-while #(not= option %) xs)))
 (defn parse-error [message] (throw (ex-info message {:hm/parse true})))
-(def value-options #{"--session" "--native-thread" "--readiness-probe" "--rollout" "--old-name" "--pane-id" "--terminal-id" "--name" "--agent" "--process-pid" "--evidence" "--evidence-sha256" "--hold-seconds" "--pane" "--target" "--receipt"})
+(def value-options #{"--session" "--native-thread" "--readiness-probe" "--rollout" "--old-name" "--pending-id" "--pane-id" "--terminal-id" "--name" "--agent" "--process-pid" "--evidence" "--evidence-sha256" "--hold-seconds" "--pane" "--target" "--receipt"})
 (defn expand-equals [xs]
   (mapcat #(if-let [[_ option value] (re-matches #"(--[^=]+)=(.*)" %)] [option value] [%]) xs))
 (defn normalize-options [xs]
@@ -80,6 +80,16 @@
                        (unknown-flags! rest #{"--session" "--native-thread" "--readiness-probe" "--rollout"})
                        (extra-values! rest #{"--session" "--native-thread" "--readiness-probe" "--rollout"})
                        (println (hm/register! flow name session thread marker rollout)))
+          "repair" (let [[flow & rest] xs]
+                     (when-not flow (parse-error "the following arguments are required: flow"))
+                     (unknown-flags! rest #{"--pending-id" "--session" "--pane-id" "--terminal-id" "--name" "--agent"})
+                     (extra-values! rest #{"--pending-id" "--session" "--pane-id" "--terminal-id" "--name" "--agent"})
+                     (let [pending-id (arg rest "--pending-id") session (arg rest "--session")
+                           pane-id (arg rest "--pane-id") terminal-id (arg rest "--terminal-id")
+                           name (arg rest "--name") agent (arg rest "--agent")]
+                       (when-not (every? some? [pending-id session pane-id terminal-id name agent])
+                         (parse-error "the following arguments are required: --pending-id, --session, --pane-id, --terminal-id, --name, --agent"))
+                       (println (hm/repair! flow pending-id session pane-id terminal-id name agent))))
           "deregister" (let [[flow & rest] xs]
                          (when-not flow (parse-error "the following arguments are required: flow"))
                          (unknown-flags! rest #{"--session" "--pane-id" "--terminal-id" "--name"})

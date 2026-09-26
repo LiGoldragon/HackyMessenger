@@ -56,6 +56,18 @@
           (fs/delete-tree root)
           (fs/delete-tree tools))))))
 
+(deftest register-cli-does-not-persist-a-failed-native-session
+  (doseq [agent-session ["absent" "malformed"]]
+    (let [{:keys [root tools environment]} (fake-herdr-environment)
+          result (invoke (assoc environment "FAKE_HERDR_AGENT_SESSION" agent-session)
+                         "hm-register" "00f95a" "Mind Sol 00f95a" "--session" "s")]
+      (try
+        (is (not (zero? (:exit result))) agent-session)
+        (is (nil? (store/route-for root "00f95a")) agent-session)
+        (finally
+          (fs/delete-tree root)
+          (fs/delete-tree tools))))))
+
 (deftest public-json-import-wrapper-is-dry-run-by-default-and-requires-apply
   (let [{:keys [source]} (legacy-test/fixture!)
         target (str (fs/path (fs/create-temp-dir {:prefix "hm-cli-import-target-"}) "target"))
@@ -159,7 +171,7 @@
       (let [held (invoke (assoc environment "FAKE_HERDR_AGENT_LIST" "empty")
                          "hm-send" "00f95a" "isolated-held" "--hold-seconds" "0")]
         (is (= 1 (:exit held)))
-        (is (str/includes? (:err held) "Held.{ 00f95a NotRegistered"))
+        (is (str/includes? (:err held) "Held.{ 00f95a RepairRequired"))
         (is (= "isolated-held" (:message (first (store/pending-for root "00f95a"))))))
 
       (let [registered (invoke environment "hm-register" "00f95a" "Mind Sol 00f95a"

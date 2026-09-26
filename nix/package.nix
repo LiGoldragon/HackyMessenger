@@ -1,7 +1,7 @@
 { lib, stdenvNoCC, babashka-unwrapped, uberjar, datalevinPod, launcher, config }:
 stdenvNoCC.mkDerivation {
   pname = "messenger-clj";
-  version = "0.2.4";
+  version = "0.2.5";
   dontUnpack = true;
   dontBuild = true;
   installPhase = ''
@@ -13,7 +13,7 @@ stdenvNoCC.mkDerivation {
       --replace-fail '@babashka@' '${babashka-unwrapped}' \
       --replace-fail '@datalevinPod@' '${datalevinPod}' \
       --replace-fail '@out@' "$out"
-    for command in send send-abrupt list register deregister rebind move retire heartbeat-state; do ln -s messenger-clj "$out/bin/hm-$command"; done
+    for command in send send-abrupt list register repair deregister rebind move retire heartbeat-state; do ln -s messenger-clj "$out/bin/hm-$command"; done
     runHook postInstall
   '';
   doInstallCheck = true;
