@@ -1,4 +1,8 @@
 (ns messenger-clj.cli-test
+  (:import [java.io BufferedReader InputStreamReader OutputStreamWriter]
+           [java.net StandardProtocolFamily UnixDomainSocketAddress]
+           [java.nio.charset StandardCharsets]
+           [java.nio.channels Channels ServerSocketChannel])
   (:require [babashka.fs :as fs]
             [babashka.process :refer [shell]]
             [clojure.edn :as edn]
@@ -14,11 +18,48 @@
 (defn invoke [environment wrapper & arguments]
   (apply shell {:out :string :err :string :continue true :extra-env environment}
          (str (fs/absolutize (fs/path "bin" wrapper))) arguments))
+(defn invoke-input [environment input wrapper & arguments]
+  (apply shell {:in input :out :string :err :string :continue true :extra-env environment}
+         (str (fs/absolutize (fs/path "bin" wrapper))) arguments))
+
+(defn fake-prompt-server [config-home]
+  (let [socket-dir (fs/path config-home "herdr" "sessions" "s")
+        socket-path (fs/path socket-dir "herdr.sock")
+        requests (atom [])
+        server (ServerSocketChannel/open StandardProtocolFamily/UNIX)]
+    (fs/create-dirs socket-dir)
+    (.bind server (UnixDomainSocketAddress/of (str socket-path)))
+    (let [worker (future
+                   (try
+                     (while (.isOpen server)
+                       (with-open [channel (.accept server)
+                                   reader (BufferedReader. (InputStreamReader. (Channels/newInputStream channel) StandardCharsets/UTF_8))
+                                   writer (OutputStreamWriter. (Channels/newOutputStream channel) StandardCharsets/UTF_8)]
+                         (let [request (json/parse-string (.readLine reader) true)
+                               text (get-in request [:params :text])
+                               response (cond
+                                          (str/includes? text "wait-submitted") {:id (:id request) :result {:ok true}}
+                                          (str/includes? text "wait-timeout") {:id (:id request) :error {:code "agent_prompt_stalled"}}
+                                          :else {:id (:id request)
+                                                 :result {:type "agent_prompted"
+                                                          :agent {:name "Mind Sol 00f95a" :pane_id "p"
+                                                                  :terminal_id "t" :agent "codex"
+                                                                  :agent_status (if (:wait (:params request)) "idle" "working")}}})]
+                           (swap! requests conj request)
+                           (.write writer (json/generate-string response))
+                           (.write writer "\n")
+                           (.flush writer))))
+                     (catch Exception error
+                       (when (.isOpen server) (throw error)))))]
+      {:requests requests :server server :worker worker
+       :close! (fn [] (.close server) (deref worker 5000 nil))})))
 
 (defn fake-herdr-environment []
   (let [root (str (fs/create-temp-dir {:prefix "hm-cli-presented-"}))
         tools (fs/create-temp-dir {:prefix "hm-cli-presented-tools-"})
         prompt-log (str (fs/path root "prompts.edn"))
+        config-home (str (fs/path root "config"))
+        prompt-server (fake-prompt-server config-home)
         herdr (fs/path tools "herdr")
         orchestrate (fs/path tools "orchestrate")]
     (fs/copy "test/fake-herdr" herdr)
@@ -26,9 +67,10 @@
           "#!/usr/bin/env bash\ncase \"$1\" in Lock.*) echo 'Locked.{ 1 Test sender [ /tmp ] test }';; Release.*) echo 'Released.{ 1 Test sender [ /tmp ] test }';; esac\n")
     (.setExecutable (java.io.File. (str herdr)) true)
     (.setExecutable (java.io.File. (str orchestrate)) true)
-    {:root root :tools tools :prompt-log prompt-log
+    {:root root :tools tools :prompt-log prompt-log :prompt-server prompt-server
      :environment {"PATH" (str tools ":" (System/getenv "PATH"))
                    "HM_REGISTRY" root "HM_PRIMARY_ROOT" root "FLOW_ID" "sender"
+                   "XDG_CONFIG_HOME" config-home
                    "FAKE_HERDR_PROMPT_LOG" prompt-log}}))
 
 (deftest wait-presented-cli-uses-one-fake-herdr-prompt-and-durable-grades
@@ -36,7 +78,7 @@
           [["presented" :Presented 0]
            ["submitted" :Uncertain 1]
            ["timeout" :Uncertain 1]]]
-    (let [{:keys [root tools prompt-log environment]} (fake-herdr-environment)
+    (let [{:keys [root tools prompt-server environment]} (fake-herdr-environment)
           env (assoc environment "FAKE_HERDR_WAIT" wait-result)]
       (try
         (is (zero? (:exit (invoke env "hm-register" "00f95a" "Mind Sol 00f95a"
@@ -45,26 +87,28 @@
               attempts (store/attempts-for root "00f95a")]
           (is (= expected-exit (:exit sent)) (str wait-result ": " (:err sent)))
           (is (str/includes? (str (:out sent) (:err sent)) (name expected-grade)))
-          (is (= 1 (count (str/split-lines (slurp prompt-log)))))
+          (is (= 1 (count @(:requests prompt-server))))
           (is (= (str "#msg [\"sender\" \"wait-" wait-result "\"]")
-                 (first (str/split-lines (slurp prompt-log)))))
+                 (get-in (first @(:requests prompt-server)) [:params :text])))
           (is (= 1 (count (filter #(= :Submitting (:reason %)) attempts))))
           (is (some #(and (= expected-grade (:grade %))
                           (= (if (zero? expected-exit) :sent :Uncertain) (:reason %)))
                     attempts)))
         (finally
+          ((:close! prompt-server))
           (fs/delete-tree root)
           (fs/delete-tree tools))))))
 
 (deftest register-cli-does-not-persist-a-failed-native-session
   (doseq [agent-session ["absent" "malformed"]]
-    (let [{:keys [root tools environment]} (fake-herdr-environment)
+    (let [{:keys [root tools prompt-server environment]} (fake-herdr-environment)
           result (invoke (assoc environment "FAKE_HERDR_AGENT_SESSION" agent-session)
                          "hm-register" "00f95a" "Mind Sol 00f95a" "--session" "s")]
       (try
         (is (not (zero? (:exit result))) agent-session)
         (is (nil? (store/route-for root "00f95a")) agent-session)
         (finally
+          ((:close! prompt-server))
           (fs/delete-tree root)
           (fs/delete-tree tools))))))
 
@@ -85,7 +129,8 @@
   (let [root (str (fs/create-temp-dir {:prefix "hm-cli-store-"}))
         tools (fs/create-temp-dir {:prefix "hm-cli-tools-"})
         state (str (fs/path root "fake-herdr-pane"))
-        prompt-log (str (fs/path root "fake-herdr-prompts.edn"))
+        config-home (str (fs/create-temp-dir {:prefix "hm-cli-config-"}))
+        prompt-server (fake-prompt-server config-home)
         evidence (fs/create-temp-file {:prefix "hm-cli-evidence-"})
         herdr (fs/path tools "herdr")
         orchestrate (fs/path tools "orchestrate")
@@ -93,8 +138,9 @@
                      "HM_REGISTRY" root
                      "HM_PRIMARY_ROOT" root
                      "FLOW_ID" "sender"
+                     "XDG_CONFIG_HOME" config-home
                      "FAKE_HERDR_STATE" state
-                     "FAKE_HERDR_PROMPT_LOG" prompt-log}]
+                     "FAKE_HERDR_PROMPT_LOG" (str (fs/path root "unused-prompts.edn"))}]
     (try
       (fs/copy "test/fake-herdr" herdr)
       (spit (str orchestrate)
@@ -124,27 +170,39 @@
         (is (str/includes? (:out sent) "Transported.{ 00f95a working }"))
         (is (some #(= :Submitting (:reason %)) (store/attempts-for root "00f95a"))))
       (let [short-body "one\ntwo\nλ"
-            long-body (str "line 1\n" (apply str (repeat 12000 "λ🙂"))
+            long-body (str "line 1 \\\"quoted\\\" \\\\ path\n" (apply str (repeat 36000 "λ🙂"))
                            "\n<pasted_content id=\"abc\">whole</pasted_content>")
             context "context first\nwith UTF-8: 世界"
-            verbatim (str "  verbatim starts\n" (str/join " " (repeat 5000 "ψ")) "\nverbatim ends  ")
-            short-send (invoke environment "hm-send" "00f95a" short-body)
-            long-send (invoke environment "hm-send" "00f95a" long-body)
-            psyche-send (invoke environment "hm-send" "00f95a" "--psyche" context verbatim)
-            lines (str/split-lines (slurp prompt-log))
-            values (mapv read-string lines)
+            verbatim (str "  verbatim starts \\\"quoted\\\" \\\\ path\n" (str/join " " (repeat 50000 "ψ")) "\nverbatim ends  ")
+            plural-records [["transcription context" "Keep the original closure text exactly."]
+                            ["explicit correction"
+                             (str "Correction: Clojure was intended; closure remains in the earlier record.\n"
+                                  "Quoted: \\\"Clojure\\\"; path: \\\\source\\file\n"
+                                  (apply str (repeat 30000 "δ🙂")))]]
+            plural-input (pr-str plural-records)
+            short-send (invoke-input environment short-body "hm-send" "00f95a" "--stdin")
+            long-send (invoke-input environment long-body "hm-send" "00f95a" "--stdin")
+            psyche-send (invoke-input environment verbatim "hm-send" "00f95a" "--psyche" context "--stdin")
+            psyches-send (invoke-input environment plural-input "hm-send" "00f95a" "--psyches" "--stdin")
+            envelopes (mapv #(get-in % [:params :text]) @(:requests prompt-server))
+            values (mapv read-string envelopes)
             attempts (store/attempts-for root "00f95a")]
         (is (zero? (:exit short-send)) (:err short-send))
         (is (zero? (:exit long-send)) (:err long-send))
         (is (zero? (:exit psyche-send)) (:err psyche-send))
-        (is (= 4 (count lines)))
-        (is (> (count (nth lines 2)) 800))
-        (is (> (count (nth lines 3)) 800))
+        (is (zero? (:exit psyches-send)) (:err psyches-send))
+        (is (> (alength (.getBytes long-body StandardCharsets/UTF_8)) (* 128 1024)))
+        (is (> (alength (.getBytes verbatim StandardCharsets/UTF_8)) (* 128 1024)))
+        (is (> (alength (.getBytes (nth envelopes 4) StandardCharsets/UTF_8)) (* 128 1024)))
+        (is (= 5 (count envelopes)))
         (is (= ["sender" short-body] (second values)))
         (is (= ["sender" long-body] (nth values 2)))
         (is (= ["sender" context verbatim] (nth values 3)))
         (is (= context (second (nth values 3))))
-        (is (not-any? #(str/includes? % "Message too long for a pane") lines))
+        (is (= (mapv (fn [[record-context record-verbatim]]
+                       ["sender" record-context record-verbatim]) plural-records)
+               (nth values 4)))
+        (is (not-any? #(str/includes? % "Message too long for a pane") envelopes))
         (is (= #{short-body long-body}
                (set (keep :body (filter #(and (contains? #{:Submitting :sent} (:reason %))
                                               (= :msg (:variant %))
@@ -157,7 +215,12 @@
           (is (every? #(= context (:context %)) psyche-attempts))
           (is (every? #(not (contains? % :part_index)) psyche-attempts))
           (is (every? #(not (contains? % :part_count)) psyche-attempts))
-          (is (every? #(= (nth lines 3) (:submitted %)) psyche-attempts))))
+          (is (every? #(= (nth envelopes 3) (:submitted %)) psyche-attempts)))
+        (let [plural-attempts (filter #(= :psyches (:variant %)) attempts)]
+          (is (= 2 (count plural-attempts)))
+          (is (= #{:Submitting :sent} (set (map :reason plural-attempts))))
+          (is (every? #(= plural-input (:body %)) plural-attempts))
+          (is (every? #(= (nth envelopes 4) (:submitted %)) plural-attempts))))
       (let [moved (invoke environment "hm-move" "00f95a" "w2"
                           "--session" "s" "--pane-id" "p" "--terminal-id" "t"
                           "--name" "Mind Sol 00f95a" "--agent" "codex"
@@ -194,6 +257,8 @@
         (is (empty? (fs/glob root "**/*.edn"))
             "operational commands create no EDN authority files"))
       (finally
+        ((:close! prompt-server))
         (fs/delete-tree root)
+        (fs/delete-tree config-home)
         (fs/delete-tree tools)
         (fs/delete-if-exists evidence)))))

@@ -74,10 +74,10 @@
     (is (= value (read-string line)))))
 
 (deftest large-multiline-utf8-and-pasted-content-are-sent-whole
-  (let [body (str "first\n" (apply str (repeat 12000 "λ🙂"))
+  (let [body (str "first\n" (apply str (repeat 24000 "λ🙂"))
                   "\n<pasted_content id=\"abc\">verbatim</pasted_content>")
         line (hm/message-envelope "sender" {:variant :msg :body body})]
-    (is (> (count line) 800))
+    (is (> (alength (.getBytes body java.nio.charset.StandardCharsets/UTF_8)) (* 128 1024)))
     (is (= ["sender" body] (hm/read-pane-message line)))
     (is (str/includes? line "pasted_content"))))
 
@@ -92,13 +92,13 @@
     (is (thrown? Exception
                  (hm/read-psyche-message "#psyche [\"sender\" \"context\" \"1/1\" \"x\"]")))))
 
-(deftest long-multiline-utf8-psyche-is-one-unbounded-envelope-with-no-numbering
+(deftest long-multiline-utf8-psyche-is-one-whole-envelope-with-no-numbering
   (let [context "word-separated Unicode"
-        verbatim (str "  λ🙂 one\n\ttwo  " (str/join " " (repeat 4000 "世界")) "  ")
+        verbatim (str "  λ🙂 one\n\ttwo  " (str/join " " (repeat 25000 "世界")) "  ")
         requests (hm/psyche-requests "sender" context verbatim)
         envelope (hm/message-envelope "sender" (first requests))]
     (is (= 1 (count requests)))
-    (is (> (count envelope) 800))
+    (is (> (alength (.getBytes verbatim java.nio.charset.StandardCharsets/UTF_8)) (* 128 1024)))
     (is (= ["sender" context verbatim] (hm/read-psyche-message envelope)))
     (is (= (seq (.getBytes verbatim java.nio.charset.StandardCharsets/UTF_8))
            (seq (.getBytes (nth (hm/read-psyche-message envelope) 2)
@@ -489,15 +489,31 @@
 
 (deftest g1-presented-wait-names-all-observable-states
   (let [calls (atom [])]
-    (with-redefs [hm/herdr! (fn [& args] (swap! calls conj (vec args)) {:type "agent_prompted"})]
+    (with-redefs [hm/herdr-socket-request! (fn [session request]
+                                             (swap! calls conj [session request])
+                                             {:type "agent_prompted"})]
       (hm/direct-prompt! route "#msg [\"sender\" \"x\"]" true)
       (hm/direct-prompt! route "#msg [\"sender\" \"y\"]" false))
-    (is (= ["--session" "s" "agent" "prompt" "p" "#msg [\"sender\" \"x\"]"
-            "--wait" "--until" "working" "--until" "idle" "--until" "done"
-            "--until" "blocked" "--timeout" "10000"]
+    (is (= ["s" {:id "messenger-clj:agent:prompt" :method "agent.prompt"
+                  :params {:target "p" :text "#msg [\"sender\" \"x\"]"
+                           :wait {:until ["working" "idle" "done" "blocked"] :timeout_ms 10000}}}]
            (first @calls)))
-    (is (= ["--session" "s" "agent" "prompt" "p" "#msg [\"sender\" \"y\"]"]
+    (is (= ["s" {:id "messenger-clj:agent:prompt" :method "agent.prompt"
+                  :params {:target "p" :text "#msg [\"sender\" \"y\"]"}}]
            (second @calls)))))
+
+(deftest herdr-socket-preflight-enforces-the-real-json-line-limit
+  (let [base-request (hm/herdr-prompt-request route "" false)
+        base-bytes (hm/herdr-request-byte-count base-request)
+        exact-text (apply str (repeat (- hm/herdr-max-initial-request-bytes base-bytes) "x"))
+        exact-request (hm/herdr-prompt-request route exact-text false)
+        overflow-request (hm/herdr-prompt-request route (str exact-text "x") false)]
+    (is (= hm/herdr-max-initial-request-bytes (hm/herdr-request-byte-count exact-request)))
+    (is (= exact-request (hm/ensure-herdr-request-fits! exact-request)))
+    (is (= (inc hm/herdr-max-initial-request-bytes) (hm/herdr-request-byte-count overflow-request)))
+    (is (re-find #"RelayOverflow: Herdr API request is 1048577 bytes; maximum is 1048576 bytes"
+                 (try (hm/ensure-herdr-request-fits! overflow-request) nil
+                      (catch Exception error (.getMessage error)))))))
 
 (deftest ledger-failure-prevents-the-live-send-prompt
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-ledger-"}))
@@ -582,6 +598,27 @@
                        (try (hm/send! "00f95a" "body" false nil) (catch Exception error (.getMessage error)))))
           (is (= 2 @prompts)))))))
 
+(deftest real-herdr-limit-is-held-durably-before-any-prompt
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-overflow-"}))
+        prompts (atom 0)
+        body (apply str (repeat hm/herdr-max-initial-request-bytes "x"))
+        good-agent (assoc route :interactive_ready true :agent_status "working")
+        transport (fake-transport good-agent good-agent
+                                  [{:argv ["codex" "--thread" (:native_thread route)]}]
+                                  prompts)]
+    (binding [hm/*root* root-path hm/*flow-id* "sender" hm/*with-reservation* pass-reservation
+              hm/*transport* transport]
+      (persist-route! root-path route)
+      (is (re-find #"Held\.\{ 00f95a RelayOverflow"
+                   (try (hm/send! "00f95a" body false nil)
+                        (catch Exception error (.getMessage error)))))
+      (is (zero? @prompts))
+      (let [pending (first (store/pending-for root-path "00f95a"))]
+        (is (= body (:message pending)))
+        (is (= :RelayOverflow (get-in pending [:attempt :reason])))
+        (is (not-any? #(= :Submitting (:reason %))
+                      (store/attempts-for root-path "00f95a")))))))
+
 (deftest listing-joins-live-agents-from-typed-routes
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-list-"}))
         second-agent {:session "s" :name "Other 123" :pane_id "x" :terminal_id "u" :agent "codex" :agent_status "idle"}]
@@ -645,7 +682,8 @@
                                 (cond
                                   (some #{"list"} args) {:agents [agent]}
                                   (some #{"process-info"} args) {:process_info {:foreground_processes []}}
-                                  :else {:agent agent}))]
+                                  :else {:agent agent}))
+                    hm/direct-prompt! (fn [& _] {:ok true})]
         (is (thrown? Exception (hm/register! "00f95a" (:name route) "s" (:native_thread route) nil nil)))
         (is (= "Registered 00f95a: Mind Sol 00f95a (s)"
                (hm/register! "00f95a" (:name route) "s" (:native_thread route) marker transcript)))

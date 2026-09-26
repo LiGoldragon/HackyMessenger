@@ -3,7 +3,9 @@
             [messenger-clj.legacy-import :as legacy]))
 (defn usage [] (str "Usage: messenger-clj <send|send-abrupt|register|repair|deregister|rebind|move|retire|import-retirement|import-json|heartbeat-state|list> ...\n"
                     "  messenger-clj send TARGET BODY [--wait-presented] [--hold-seconds N] [--pane SESSION:PANE]\n"
-                    "  messenger-clj send TARGET --psyche CONTEXT VERBATIM [--wait-presented] [--hold-seconds N] [--pane SESSION:PANE]\n"
+                    "  messenger-clj send TARGET --stdin [--wait-presented] [--hold-seconds N] [--pane SESSION:PANE]\n"
+                    "  messenger-clj send TARGET --psyche CONTEXT (VERBATIM|--stdin) [--wait-presented] [--hold-seconds N] [--pane SESSION:PANE]\n"
+                    "  messenger-clj send TARGET --psyches --stdin [--wait-presented] [--hold-seconds N] [--pane SESSION:PANE]\n"
                     hm/skill-note))
 (defn arg [xs option] (second (drop-while #(not= option %) xs)))
 (defn parse-error [message] (throw (ex-info message {:hm/parse true})))
@@ -15,7 +17,7 @@
     (loop [remaining xs positional [] options []]
       (if-let [value (first remaining)]
         (cond
-          (contains? #{"--wait-presented" "--apply" "--psyche"} value) (recur (next remaining) positional (conj options value))
+          (contains? #{"--wait-presented" "--apply" "--psyche" "--psyches" "--stdin"} value) (recur (next remaining) positional (conj options value))
           (contains? value-options value) (if-let [argument (second remaining)]
                                             (recur (nnext remaining) positional (into options [value argument]))
                                             (parse-error (str "argument " value ": expected one argument")))
@@ -26,13 +28,30 @@
   (loop [remaining xs]
     (when-let [value (first remaining)]
       (cond
-        (contains? #{"--wait-presented" "--apply" "--psyche"} value) (recur (next remaining))
+        (contains? #{"--wait-presented" "--apply" "--psyche" "--psyches" "--stdin"} value) (recur (next remaining))
         (contains? value-options value) (recur (nnext remaining))
         (contains? allowed value) (recur (next remaining))
         :else (parse-error (str "unrecognized arguments: " value))))))
 (defn unknown-flags! [xs allowed]
   (doseq [value xs :when (and (.startsWith value "--") (not (contains? allowed value)))]
     (parse-error (str "unrecognized arguments: " value))))
+(defn input-mode [xs]
+  (let [psyche? (boolean (some #{"--psyche"} xs))
+        psyches? (boolean (some #{"--psyches"} xs))
+        stdin? (boolean (some #{"--stdin"} xs))
+        mode (cond psyches? :psyches psyche? :psyche :else :msg)
+        positional-count (count (take-while #(not (.startsWith % "--")) xs))
+        expected-count (case [mode stdin?]
+                         [:msg false] 2 [:msg true] 1
+                         [:psyche false] 3 [:psyche true] 2
+                         [:psyches true] 1
+                         1)]
+    (when (and psyche? psyches?) (parse-error "--psyche and --psyches are mutually exclusive"))
+    (when (and psyches? (not stdin?)) (parse-error "--psyches requires --stdin"))
+    (when-not (= expected-count positional-count)
+      (parse-error "message input arguments do not match the selected --stdin/--psyche/--psyches mode"))
+    {:mode mode :stdin? stdin?}))
+(defn stdin-text! [] (slurp *in*))
 (defn -main [& argv]
   (try
     (let [[op & raw-xs] argv
@@ -40,39 +59,44 @@
       (if (or (= op "--help") (= op "-h") (some #{"--help" "-h"} xs))
         (println (usage))
         (case op
-          "send" (let [psyche? (boolean (some #{"--psyche"} xs))
+          "send" (let [{:keys [mode stdin?]} (input-mode xs)
                        [flow first-field second-field & tail] xs
-                       [context body rest] (if psyche?
-                                             [first-field second-field tail]
-                                             [nil first-field (if (nil? second-field) tail (cons second-field tail))])]
-                   (when-not (and flow body (or (not psyche?) context))
-                     (parse-error (if psyche?
-                                    "the following arguments are required: flow, --psyche, context, verbatim"
-                                    "the following arguments are required: flow, message")))
-                   (unknown-flags! rest #{"--psyche" "--wait-presented" "--hold-seconds" "--pane"})
-                   (extra-values! rest #{"--psyche" "--wait-presented" "--hold-seconds" "--pane"})
+                       [context argv-body rest] (case mode
+                                                  :psyche [first-field second-field tail]
+                                                  :psyches [nil nil (rest xs)]
+                                                  :msg [nil first-field (if (nil? second-field) tail (cons second-field tail))])
+                       body (if stdin? (stdin-text!) argv-body)]
+                   (when-not (and flow body (or (not= mode :psyche) context))
+                     (parse-error (case mode
+                                    :psyche "the following arguments are required: flow, --psyche, context, verbatim or --stdin"
+                                    :psyches "the following arguments are required: flow, --psyches, --stdin"
+                                    "the following arguments are required: flow, message or --stdin")))
+                   (unknown-flags! rest #{"--psyche" "--psyches" "--stdin" "--wait-presented" "--hold-seconds" "--pane"})
+                   (extra-values! rest #{"--psyche" "--psyches" "--stdin" "--wait-presented" "--hold-seconds" "--pane"})
                    (let [hold (try (Double/parseDouble (or (arg rest "--hold-seconds") "10"))
                                    (catch Exception _ (parse-error "argument --hold-seconds: invalid float value")))]
                      (when-not (<= 0 hold 60) (hm/fail "--hold-seconds must be between 0 and 60"))
-                     (println (if psyche?
-                                (hm/send-psyche! flow context body (boolean (some #{"--wait-presented"} rest)) (arg rest "--pane") hold)
+                     (println (case mode
+                                :psyche (hm/send-psyche! flow context body (boolean (some #{"--wait-presented"} rest)) (arg rest "--pane") hold)
+                                :psyches (hm/send-psyches! flow body (boolean (some #{"--wait-presented"} rest)) (arg rest "--pane") hold)
                                 (hm/send! flow body (boolean (some #{"--wait-presented"} rest)) (arg rest "--pane") hold)))))
-          "send-abrupt" (let [psyche? (boolean (some #{"--psyche"} xs))
+          "send-abrupt" (let [{:keys [mode stdin?]} (input-mode xs)
                               [flow first-field second-field & tail] xs
-                              [context body rest] (if psyche?
-                                                    [first-field second-field tail]
-                                                    [nil first-field (if (nil? second-field) tail (cons second-field tail))])]
-                          (when-not (and flow body (or (not psyche?) context))
-                            (parse-error (if psyche?
-                                           "the following arguments are required: flow, --psyche, context, verbatim"
-                                           "the following arguments are required: flow, message")))
-                          (unknown-flags! rest #{"--psyche" "--wait-presented" "--hold-seconds"})
-                          (extra-values! rest #{"--psyche" "--wait-presented" "--hold-seconds"})
+                              [context argv-body rest] (case mode
+                                                         :psyche [first-field second-field tail]
+                                                         :psyches [nil nil (rest xs)]
+                                                         :msg [nil first-field (if (nil? second-field) tail (cons second-field tail))])
+                              body (if stdin? (stdin-text!) argv-body)]
+                          (when-not (and flow body (or (not= mode :psyche) context))
+                            (parse-error "send-abrupt requires flow and the selected message input"))
+                          (unknown-flags! rest #{"--psyche" "--psyches" "--stdin" "--wait-presented" "--hold-seconds"})
+                          (extra-values! rest #{"--psyche" "--psyches" "--stdin" "--wait-presented" "--hold-seconds"})
                           (let [hold (try (Double/parseDouble (or (arg rest "--hold-seconds") "10"))
                                           (catch Exception _ (parse-error "argument --hold-seconds: invalid float value")))]
                             (when-not (<= 0 hold 60) (hm/fail "--hold-seconds must be between 0 and 60")))
-                          (println (if psyche?
-                                     (hm/send-abrupt-psyche! flow context body (boolean (some #{"--wait-presented"} rest)))
+                          (println (case mode
+                                     :psyche (hm/send-abrupt-psyche! flow context body (boolean (some #{"--wait-presented"} rest)))
+                                     :psyches (hm/send-abrupt-request! flow {:variant :psyches :body body} (boolean (some #{"--wait-presented"} rest)))
                                      (hm/send-abrupt! flow body (boolean (some #{"--wait-presented"} rest))))))
           "register" (let [[flow name & rest] xs session (arg rest "--session") thread (arg rest "--native-thread")
                            marker (arg rest "--readiness-probe") rollout (arg rest "--rollout")]

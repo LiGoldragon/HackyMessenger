@@ -40,13 +40,13 @@
 (def Attempt
   [:map {:closed true}
    [:id :string] [:flow :string] [:at :string] [:grade {:optional true} :keyword] [:reason :keyword]
-   [:variant {:optional true} [:enum :msg :psyche]]
+   [:variant {:optional true} [:enum :msg :psyche :psyches]]
    [:context {:optional true} [:maybe :string]] [:body {:optional true} :string]
    [:part_index {:optional true} pos-int?] [:part_count {:optional true} pos-int?]
    [:submitted {:optional true} :string] [:binding {:optional true} AttemptBinding]])
 (def Pending
   [:map {:closed true}
-   [:attempt Attempt] [:message :string] [:variant {:optional true} [:enum :msg :psyche]]
+   [:attempt Attempt] [:message :string] [:variant {:optional true} [:enum :msg :psyche :psyches]]
    [:context {:optional true} [:maybe :string]]
    [:part_index {:optional true} pos-int?] [:part_count {:optional true} pos-int?]
    [:state [:= "held"]]])

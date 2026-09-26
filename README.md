@@ -43,10 +43,29 @@ A long or multiline envelope sent to Claude may be displayed inside Claude's
 `pasted_content` wrapper; that presentation is accepted transport behavior and
 does not change the submitted envelope or ledger record.
 
-`#msg` also has no size limit and carries one whole machine message. The ledger
-records the variant, exact input fields, and exact envelope for every submission
-attempt. Historical numbered psyche attempts remain readable in the existing
-Datalevin state, but new attempts never write part fields.
+Several living records can travel in one tagged envelope:
+
+```clojure
+#psyches [["FLOW_ID" "first context" "first whole verbatim"]
+          ["FLOW_ID" "second context" "second whole verbatim"]]
+```
+
+The sender is derived once from `FLOW_ID` and placed into every record. The
+stdin payload is an EDN vector of `[context verbatim]` pairs, so callers cannot
+supply a different sender for an entry. Each context and verbatim remains its
+own complete string.
+
+`#msg`, `#psyche`, and `#psyches` each carry one whole envelope. Messenger does
+not split, truncate, create overflow files, or substitute pointers. The Herdr
+0.8 socket protocol limits its complete initial JSON request line to 1,048,576
+UTF-8 bytes, excluding the terminating newline. Messenger serializes the exact
+`agent.prompt` request first and holds `RelayOverflow` durably before prompting
+when that real limit is exceeded. JSON escaping and request metadata count
+toward the limit, so there is no smaller fixed message-character cap.
+
+The ledger records the variant, exact input fields, and exact envelope for
+every submission attempt. Historical numbered psyche attempts remain readable
+in the existing Datalevin state, but new attempts never write part fields.
 
 Pass only the body to `hm-send` or `messenger-clj send`. A field that parses as
 one complete `#msg` or `#psyche` form is rejected. Ordinary prose may mention
@@ -60,7 +79,16 @@ During development, the Bash launcher runs Babashka against the source tree:
 bin/messenger-clj --help
 FLOW_ID=<self> bin/messenger-clj send TARGET 'text'
 FLOW_ID=<self> bin/messenger-clj send TARGET --psyche 'why these words matter' 'verbatim words'
+printf '%s' 'multiline body' | FLOW_ID=<self> bin/messenger-clj send TARGET --stdin
+printf '%s' '[["context" "whole verbatim"]]' | FLOW_ID=<self> bin/messenger-clj send TARGET --psyches --stdin
 ```
+
+`--stdin` reads the complete standard input as the machine body or, with
+`--psyche CONTEXT`, as that record's verbatim. `--psyches --stdin` reads the
+plural EDN payload. This avoids Linux's per-argument size limit for both the
+public command and the downstream prompt: Messenger submits the resulting
+request through Herdr's Unix socket API rather than placing the envelope in a
+Herdr CLI argument.
 
 The `hm-*` scripts are development compatibility launchers. JSON migration is
 available only through `messenger-clj import-json`; it is not an operational

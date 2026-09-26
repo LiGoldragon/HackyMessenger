@@ -1,5 +1,8 @@
 (ns messenger-clj.core
-  (:import [java.io PushbackReader StringReader])
+  (:import [java.io BufferedReader InputStreamReader OutputStreamWriter PushbackReader StringReader]
+           [java.net UnixDomainSocketAddress]
+           [java.nio.charset StandardCharsets]
+           [java.nio.channels Channels SocketChannel])
   (:require [babashka.fs :as fs]
             [cheshire.core :as json]
             [babashka.process :refer [shell]]
@@ -14,7 +17,7 @@
 (def FlowId [:and [:string {:min 1 :max 96}] [:re #"^[A-Za-z0-9][A-Za-z0-9_-]*$"]])
 (def NativeThread [:and [:string {:min 16 :max 96}] [:re #"^[A-Za-z0-9][A-Za-z0-9-]+$"]])
 (def MessageBody [:string {:min 1}])
-(def MessageVariant [:enum :msg :psyche])
+(def MessageVariant [:enum :msg :psyche :psyches])
 (def ReadinessProof [:map {:closed true} [:thread_id NativeThread] [:rollout :string] [:marker :string] [:evidence_kind {:optional true} :string]])
 (def RouteBinding [:map {:closed true} [:session :string] [:name :string] [:pane_id :string] [:terminal_id :string] [:agent :string] [:native_thread {:optional true} NativeThread] [:readiness_proof {:optional true} ReadinessProof] [:route_hold {:optional true} :string] [:transition {:optional true} :boolean] [:state {:optional true} :string]])
 (def DeliveryAttempt [:map {:closed true} [:id :string] [:at :string] [:flow FlowId] [:reason :keyword] [:grade {:optional true} :keyword] [:variant {:optional true} MessageVariant] [:context {:optional true} [:maybe MessageBody]] [:body {:optional true} MessageBody] [:part_index {:optional true} pos-int?] [:part_count {:optional true} pos-int?] [:submitted {:optional true} :string] [:binding {:optional true} RouteBinding]])
@@ -25,8 +28,10 @@
 (def Reservation [:map {:closed true} [:id :int] [:flow FlowId] [:root :string]])
 (def PaneMessage [:tuple FlowId MessageBody])
 (def PsycheMessage [:tuple FlowId MessageBody MessageBody])
+(def PsychesMessage [:vector {:min 1} PsycheMessage])
+(def PsychesInput [:vector {:min 1} [:tuple MessageBody MessageBody]])
 (def MessageRequest [:map {:closed true} [:variant MessageVariant] [:body MessageBody] [:context {:optional true} [:maybe MessageBody]]])
-(doseq [schema [FlowId NativeThread MessageBody MessageVariant ReadinessProof RouteBinding DeliveryAttempt PendingIntent RetirementMarker Reservation PaneMessage PsycheMessage MessageRequest]] (m/validator schema))
+(doseq [schema [FlowId NativeThread MessageBody MessageVariant ReadinessProof RouteBinding DeliveryAttempt PendingIntent RetirementMarker Reservation PaneMessage PsycheMessage PsychesMessage PsychesInput MessageRequest]] (m/validator schema))
 
 (defn fail [s] (throw (ex-info s {:hm/failure true})))
 (defn valid! [schema value label]
@@ -120,6 +125,8 @@
   (valid! PaneMessage value "#msg"))
 (defn read-psyche [value]
   (valid! PsycheMessage value "#psyche"))
+(defn read-psyches [value]
+  (valid! PsychesMessage value "#psyches"))
 (defn- read-complete [readers line]
   (with-open [reader (PushbackReader. (StringReader. line))]
     (let [eof (Object.)
@@ -136,19 +143,34 @@
   (let [tagged ::tagged
         value (read-complete {'psyche #(hash-map tagged (read-psyche %))} line)]
     (or (get value tagged) (fail "Expected one complete #psyche form"))))
+(defn read-psyches-message [line]
+  (let [tagged ::tagged
+        value (read-complete {'psyches #(hash-map tagged (read-psyches %))} line)]
+    (or (get value tagged) (fail "Expected one complete #psyches form"))))
+(defn read-psyches-input [text]
+  (valid! PsychesInput (read-complete {} text) "plural psyche input"))
 (defn request! [request]
   (let [request (valid! MessageRequest request "MessageRequest")]
     (when (and (= :psyche (:variant request)) (not (contains? request :context)))
       (fail "Psyche messages require context"))
     (when (and (= :msg (:variant request)) (contains? request :context))
       (fail "Machine messages do not carry psyche context"))
+    (when (and (= :psyches (:variant request)) (contains? request :context))
+      (fail "Plural psyche input carries one context inside each record"))
+    (when (= :psyches (:variant request))
+      (read-psyches-input (:body request)))
     request))
 (defn message-envelope [sender request]
   (flow-id! sender)
   (let [{:keys [variant context body]} (request! request)
         [tag value reader] (case variant
                              :msg ["#msg" (read-msg [sender body]) read-pane-message]
-                             :psyche ["#psyche" (read-psyche [sender context body]) read-psyche-message])
+                             :psyche ["#psyche" (read-psyche [sender context body]) read-psyche-message]
+                             :psyches ["#psyches"
+                                       (read-psyches (mapv (fn [[record-context verbatim]]
+                                                             [sender record-context verbatim])
+                                                           (read-psyches-input body)))
+                                       read-psyches-message])
         envelope (str tag " " (pr-str value))]
     (when-not (= value (reader envelope))
       (fail (str tag " EDN round trip failed; message held")))
@@ -159,12 +181,15 @@
 (defn psyche-requests [sender context verbatim]
   (flow-id! sender)
   [(request! {:variant :psyche :context context :body verbatim})])
+(defn psyches-envelope [sender records]
+  (message-envelope sender {:variant :psyches :body (pr-str (valid! PsychesInput records "plural psyche input"))}))
 (defn relay-line [sender _recipient body] (message-envelope sender {:variant :msg :body body}))
 (defn relay [sender recipient body] (relay-line sender recipient body))
 (defn framed-text [sender _recipient body] (message-envelope sender {:variant :msg :body body}))
 (defn nested-relay? [body]
   (or (try (read-pane-message body) true (catch Exception _ false))
-      (try (read-psyche-message body) true (catch Exception _ false))))
+      (try (read-psyche-message body) true (catch Exception _ false))
+      (try (read-psyches-message body) true (catch Exception _ false))))
 (defn read-route [flow]
   (try
     (if-let [route (load-route (registry) flow)]
@@ -184,10 +209,51 @@
 (declare shell-live-agents)
 (def presented-wait-args ["--wait" "--until" "working" "--until" "idle" "--until" "done"
                           "--until" "blocked" "--timeout" "10000"])
+(def herdr-max-initial-request-bytes (* 1024 1024))
+(defn herdr-socket-path [session]
+  (let [config-home (or (System/getenv "XDG_CONFIG_HOME")
+                        (str (fs/path (System/getProperty "user.home") ".config")))]
+    (str (fs/path config-home "herdr" "sessions" session "herdr.sock"))))
+(defn herdr-prompt-request [route envelope wait-presented]
+  {:id "messenger-clj:agent:prompt"
+   :method "agent.prompt"
+   :params (cond-> {:target (:pane_id route) :text envelope}
+             wait-presented (assoc :wait {:until ["working" "idle" "done" "blocked"]
+                                           :timeout_ms 10000}))})
+(defn herdr-request-line [request]
+  (json/generate-string request))
+(defn herdr-request-byte-count [request]
+  (alength (.getBytes ^String (herdr-request-line request) StandardCharsets/UTF_8)))
+(defn ensure-herdr-request-fits! [request]
+  (let [bytes (herdr-request-byte-count request)]
+    (when (> bytes herdr-max-initial-request-bytes)
+      (fail (str "RelayOverflow: Herdr API request is " bytes
+                 " bytes; maximum is " herdr-max-initial-request-bytes " bytes")))
+    request))
+(defn herdr-socket-request! [session request]
+  (let [request (ensure-herdr-request-fits! request)
+        socket-path (herdr-socket-path session)]
+    (try
+      (with-open [channel (SocketChannel/open (UnixDomainSocketAddress/of socket-path))
+                  writer (OutputStreamWriter. (Channels/newOutputStream channel) StandardCharsets/UTF_8)
+                  reader (BufferedReader. (InputStreamReader. (Channels/newInputStream channel) StandardCharsets/UTF_8))]
+        (.write writer ^String (herdr-request-line request))
+        (.write writer "\n")
+        (.flush writer)
+        (let [line (.readLine reader)]
+          (when (str/blank? line)
+            (fail "Herdr socket returned an empty response; do not blindly retry a send"))
+          (let [reply (json/parse-string line true)]
+            (when (:error reply) (fail (str "Herdr: " (:error reply))))
+            (let [result (or (:result reply) reply)]
+              (when-not (map? result)
+                (fail "Herdr socket returned malformed result; do not blindly retry a send"))
+              result))))
+      (catch clojure.lang.ExceptionInfo error (throw error))
+      (catch Exception error
+        (fail (str "Herdr socket request failed or is uncertain: " (.getMessage error)))))))
 (defn direct-prompt! [route envelope wait-presented]
-  (let [args (cond-> ["--session" (:session route) "agent" "prompt" (:pane_id route) envelope]
-               wait-presented (into presented-wait-args))]
-    (apply herdr! args)))
+  (herdr-socket-request! (:session route) (herdr-prompt-request route envelope wait-presented)))
 (defn presented! [route reply]
   ;; A waited Herdr prompt returns agent_prompted after observing one of the
   ;; requested lifecycle states.  Bind that observation to the exact pane.
@@ -363,6 +429,8 @@
 (defn attempt-fields [request submitted]
   (cond-> (select-keys (request! request) [:variant :context :body])
     submitted (assoc :submitted submitted)))
+(defn prompt-request! [route envelope wait-presented]
+  (ensure-herdr-request-fits! (herdr-prompt-request route envelope wait-presented)))
 (defn append-attempt! [flow reason grade route request submitted]
   (let [attempt (cond-> {:id (str (java.util.UUID/randomUUID)) :at (now) :flow flow :reason reason :grade grade}
                   request (merge (attempt-fields request submitted))
@@ -561,13 +629,17 @@
                                     (= :psyche (:variant pending)) (assoc :context (:context pending))))
                 envelope (get-in pending [:attempt :submitted])
                 parsed (when (string? envelope)
-                         (if (= :psyche (:variant request))
-                           (let [[_ context body] (read-psyche-message envelope)]
-                             {:variant :psyche :context context :body body})
-                           (let [[_ body] (read-pane-message envelope)]
-                             {:variant :msg :body body})))
+                         (case (:variant request)
+                           :psyche (let [[_ context body] (read-psyche-message envelope)]
+                                      {:variant :psyche :context context :body body})
+                           :psyches {:variant :psyches
+                                     :body (pr-str (mapv (fn [[_ context body]] [context body])
+                                                         (read-psyches-message envelope)))}
+                           :msg (let [[_ body] (read-pane-message envelope)]
+                                  {:variant :msg :body body})))
                 _ (when-not (= (select-keys request [:variant :context :body]) parsed)
                     (fail "Repair pending envelope is missing or differs from the held message"))
+                _ (prompt-request! route envelope false)
                 repair-attempt (delivery-attempt!
                                 {:id (str (java.util.UUID/randomUUID)) :at (now) :flow flow
                                  :reason :RouteRepaired :grade :Repaired :binding route})
@@ -746,11 +818,13 @@
                   "claude" {:interrupt ["esc" "esc"] :submit ["enter"]}})
 (defn validate-request! [request]
   (let [{:keys [context body] :as request} (request! request)
-        values (cond-> [body] (some? context) (conj context))]
+        values (if (= :psyches (:variant request))
+                 (mapcat identity (read-psyches-input body))
+                 (cond-> [body] (some? context) (conj context)))]
     (when (some #(or (str/blank? %) (re-find #"[\p{Cc}&&[^\n\t]]" %)) values)
       (fail "Message fields must be nonempty and contain no terminal control characters"))
     (when (some nested-relay? values)
-      (fail "Nested complete #msg or #psyche form is not a message field"))
+      (fail "Nested complete #msg or #psyche or #psyches form is not a message field"))
     request))
 (defn send-abrupt-request! [flow request wait-presented]
   (flow-id! flow)
@@ -768,6 +842,11 @@
                 keys (get abrupt-keys (:agent route))]
             (when-not keys (fail (str "Hard-abrupt is not supported for " (:agent route) "; nothing sent")))
             (let [envelope (message-envelope sender request)
+                  _ (try (prompt-request! route envelope wait-presented)
+                         (catch Exception error
+                           (if (str/starts-with? (.getMessage error) "RelayOverflow:")
+                             (held! flow :RelayOverflow request route)
+                             (throw error))))
                   submission (append-attempt! flow :Submitting :Uncertain route request envelope)]
               (try
                 (doseq [key (:interrupt keys)] (send-keys* (transport) route key))
@@ -827,6 +906,11 @@
                                  (hold-repair-required! flow raw-stored pane request)))))
                  route (refresh-route-snapshot route live)
                  envelope (message-envelope sender request)
+                 _ (try (prompt-request! route envelope wait-presented)
+                        (catch Exception error
+                          (if (str/starts-with? (.getMessage error) "RelayOverflow:")
+                            (held! flow :RelayOverflow request route)
+                            (throw error))))
                  submission (try (append-attempt! flow :Submitting :Uncertain route request envelope)
                                  (catch Exception error
                                    (if (:hm/invalid (ex-data error))
@@ -854,6 +938,12 @@
    (send-psyche! flow context verbatim wait-presented pane 10))
   ([flow context verbatim wait-presented pane hold-seconds]
    (send-request! flow {:variant :psyche :context context :body verbatim}
+                  wait-presented pane hold-seconds)))
+(defn send-psyches!
+  ([flow input wait-presented pane]
+   (send-psyches! flow input wait-presented pane 10))
+  ([flow input wait-presented pane hold-seconds]
+   (send-request! flow {:variant :psyches :body input}
                   wait-presented pane hold-seconds)))
 (defn route-records []
   (into {} (remove (fn [[flow _]] (store/retirement-for (root) flow))
