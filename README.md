@@ -32,25 +32,25 @@ retirements stay in the typed ledger.
 Living words use a separate variant:
 
 ```clojure
-#psyche ["FLOW_ID" "context first" "1/2" "first verbatim piece "]
-#psyche ["FLOW_ID" nil             "2/2" "second verbatim piece"]
+#psyche ["FLOW_ID" "context" "whole verbatim"]
 ```
 
-Each complete `#psyche` envelope is at most 800 characters. Messenger packs the
-verbatim input at word or whitespace boundaries, recomputes the pieces until
-the `i/n` labels stabilize, and submits them sequentially. Context appears only
-on the first piece. Concatenating the piece fields reproduces the verbatim
-input exactly, including whitespace, newlines, and Unicode. A context or word
-that cannot fit is held durably before any prompt. If one prompt is uncertain,
-later pieces are not attempted.
+Each `#psyche` submission is one envelope containing the sender, context, and
+the whole verbatim input. It has no 800-character cap, part-number field,
+splitting, overflow file, or pointer. EDN escaping preserves the exact input
+bytes represented by the strings, including whitespace, newlines, and Unicode.
+A long or multiline envelope sent to Claude may be displayed inside Claude's
+`pasted_content` wrapper; that presentation is accepted transport behavior and
+does not change the submitted envelope or ledger record.
 
-`#msg` has no 800-character limit and continues to carry one whole machine
-message. The ledger records the variant, part numbers, exact input fields, and
-exact envelope for every submission attempt.
+`#msg` also has no size limit and carries one whole machine message. The ledger
+records the variant, exact input fields, and exact envelope for every submission
+attempt. Historical numbered psyche attempts remain readable in the existing
+Datalevin state, but new attempts never write part fields.
 
 Pass only the body to `hm-send` or `messenger-clj send`. A field that parses as
 one complete `#msg` or `#psyche` form is rejected. Ordinary prose may mention
-either tag. There is no overflow file or pointer path.
+either tag.
 
 ## Use
 

@@ -76,68 +76,49 @@
     (is (= ["sender" body] (hm/read-pane-message line)))
     (is (str/includes? line "pasted_content"))))
 
-(deftest psyche-edn-round-trip-keeps-number-context-and-verbatim-exactly
+(deftest psyche-edn-round-trip-keeps-context-and-whole-verbatim-exactly
   (let [context "why this matters\nwith detail"
         verbatim " living's λ words\nexactly  "
-        request {:variant :psyche :context context :body verbatim
-                 :part_index 1 :part_count 1}
+        request {:variant :psyche :context context :body verbatim}
         line (hm/message-envelope "e51411" request)]
     (is (str/starts-with? line "#psyche [\"e51411\""))
-    (is (= ["e51411" context "1/1" verbatim] (hm/read-psyche-message line)))
-    (is (= ["e51411" context "1/1" verbatim] (read-string line)))
-    (is (thrown? Exception (hm/read-psyche-message "#psyche [\"sender\" nil \"2/1\" \"x\"]")))))
+    (is (= ["e51411" context verbatim] (hm/read-psyche-message line)))
+    (is (= ["e51411" context verbatim] (read-string line)))
+    (is (thrown? Exception
+                 (hm/read-psyche-message "#psyche [\"sender\" \"context\" \"1/1\" \"x\"]")))))
 
-(deftest psyche-packing-holds-every-envelope-within-800-and-reassembles-bytes
+(deftest long-multiline-utf8-psyche-is-one-unbounded-envelope-with-no-numbering
   (let [context "word-separated Unicode"
         verbatim (str "  λ🙂 one\n\ttwo  " (str/join " " (repeat 4000 "世界")) "  ")
         requests (hm/psyche-requests "sender" context verbatim)
-        envelopes (mapv #(hm/message-envelope "sender" %) requests)
-        total (count requests)]
-    (is (> total 9))
-    (is (= verbatim (apply str (map :body requests))))
-    (is (= context (:context (first requests))))
-    (is (every? nil? (map :context (rest requests))))
-    (is (every? #(<= (count %) 800) envelopes))
-    (is (= (mapv #(str % "/" total) (range 1 (inc total)))
-           (mapv #(nth (hm/read-psyche-message %) 2) envelopes)))))
+        envelope (hm/message-envelope "sender" (first requests))]
+    (is (= 1 (count requests)))
+    (is (> (count envelope) 800))
+    (is (= ["sender" context verbatim] (hm/read-psyche-message envelope)))
+    (is (= (seq (.getBytes verbatim java.nio.charset.StandardCharsets/UTF_8))
+           (seq (.getBytes (nth (hm/read-psyche-message envelope) 2)
+                           java.nio.charset.StandardCharsets/UTF_8))))
+    (is (not (re-find #"[0-9]+/[0-9]+" envelope)))
+    (is (not (contains? (first requests) :part_index)))
+    (is (not (contains? (first requests) :part_count)))))
 
-(deftest psyche-envelope-799-800-801-boundaries-and-unsplittable-word
-  (let [base (count (hm/psyche-envelope "sender" "context" 1 1 "x"))
-        body-for (fn [target] (apply str (repeat (+ 1 (- target base)) "x")))
-        body-799 (body-for 799)
-        body-800 (body-for 800)
-        body-801 (body-for 801)]
-    (is (= 799 (count (hm/psyche-envelope "sender" "context" 1 1 body-799))))
-    (is (= 800 (count (hm/psyche-envelope "sender" "context" 1 1 body-800))))
-    (is (= body-800 (:body (first (hm/psyche-requests "sender" "context" body-800)))))
-    (let [diagnostic (try (hm/psyche-requests "sender" "context" body-801)
-                          (catch Exception error (.getMessage error)))]
-      (is (re-find #"cannot fit" diagnostic))
-      (is (not (str/includes? diagnostic body-801))))
-    (let [oversized-context (apply str (repeat 900 "c"))
-          diagnostic (try (hm/psyche-requests "sender" oversized-context "word")
-                          (catch Exception error (.getMessage error)))]
-      (is (re-find #"cannot fit" diagnostic))
-      (is (not (str/includes? diagnostic oversized-context))))))
-
-(deftest unsplittable-psyche-word-is-held-durably-before-any-prompt
-  (let [root-path (str (fs/create-temp-dir {:prefix "hm-psyche-overflow-"}))
-        prompts (atom 0)
-        secret-word (apply str (repeat 900 "秘密"))]
+(deftest unavailable-herdr-holds-one-whole-psyche-envelope-durably
+  (let [root-path (str (fs/create-temp-dir {:prefix "hm-psyche-held-"}))
+        verbatim (str "first\n" (apply str (repeat 900 "秘密")) "\nlast")]
     (binding [hm/*root* root-path hm/*flow-id* "sender"
               hm/*with-reservation* pass-reservation]
-      (with-redefs [hm/direct-prompt! (fn [& _] (swap! prompts inc))]
-        (let [diagnostic (try (hm/send-psyche! "00f95a" "context" secret-word false nil 0)
+      (with-redefs [hm/live-agents (constantly [])]
+        (let [diagnostic (try (hm/send-psyche! "00f95a" "context" verbatim false nil 0)
                               (catch Exception error (.getMessage error)))
               pending (first (store/pending-for root-path "00f95a"))]
-          (is (re-find #"Held\.\{ 00f95a RelayOverflow" diagnostic))
-          (is (not (str/includes? diagnostic secret-word)))
-          (is (zero? @prompts))
-          (is (= secret-word (:message pending)))
-          (is (= :RelayOverflow (get-in pending [:attempt :reason])))
-          (is (= :psyche (:variant pending))))))))
+          (is (re-find #"Held\.\{ 00f95a NotRegistered" diagnostic))
+          (is (= verbatim (:message pending)))
+          (is (= "context" (:context pending)))
+          (is (= :psyche (:variant pending)))
+          (is (not (contains? pending :part_index)))
+          (is (not (contains? pending :part_count))))))))
 
-(deftest psyche-parts-stop-sequentially-after-one-uncertain-prompt
+(deftest psyche-herdr-failure-is-one-whole-uncertain-attempt
   (let [root-path (str (fs/create-temp-dir {:prefix "hm-psyche-partial-"}))
         calls (atom [])
         live (assoc route :interactive_ready true :agent_status "working")
@@ -151,9 +132,7 @@
                     (send-keys* [_ _ _] {:ok true})
                     (prompt!* [_ _ envelope _]
                       (swap! calls conj envelope)
-                      (if (= 3 (count @calls))
-                        (hm/fail "simulated Herdr failure")
-                        {:ok true})))
+                      (hm/fail "simulated Herdr failure")))
         verbatim (str/join " " (repeat 1500 "λword"))]
     (binding [hm/*root* root-path hm/*flow-id* "sender"
               hm/*with-reservation* pass-reservation hm/*transport* transport]
@@ -163,14 +142,13 @@
             attempts (filter #(= :psyche (:variant %))
                              (store/attempts-for root-path "00f95a"))]
         (is (re-find #"Uncertain\.\{ 00f95a" diagnostic))
-        (is (= 3 (count @calls)))
-        (is (every? #(<= (count %) 800) @calls))
-        (is (= #{1 2 3} (set (map :part_index attempts))))
-        (is (= 2 (count (filter #(= :sent (:reason %)) attempts))))
-        (is (= 1 (count (filter #(and (= 3 (:part_index %))
-                                      (= :Submitting (:reason %))) attempts))))
-        (is (= 1 (count (filter #(and (= 3 (:part_index %))
-                                      (= :Uncertain (:reason %))) attempts))))))))
+        (is (= 1 (count @calls)))
+        (is (= ["sender" "context" verbatim]
+               (hm/read-psyche-message (first @calls))))
+        (is (= #{:Submitting :Uncertain} (set (map :reason attempts))))
+        (is (every? #(= (first @calls) (:submitted %)) attempts))
+        (is (every? #(not (contains? % :part_index)) attempts))
+        (is (every? #(not (contains? % :part_count)) attempts))))))
 
 (deftest nested-pane-message-is-rejected-before-send
   (let [secret "DIAGNOSTIC_SECRET_7391"
@@ -180,13 +158,13 @@
     (is (not (str/includes? diagnostic secret))))
   (is (re-find #"Nested complete #msg or #psyche"
                (binding [hm/*flow-id* "sender"]
-                 (try (hm/send-psyche! "00f95a" "context" "#psyche [\"sender\" nil \"1/1\" \"v\"]" false nil)
+                 (try (hm/send-psyche! "00f95a" "context" "#psyche [\"sender\" \"context\" \"v\"]" false nil)
                       (catch Exception error (.getMessage error)))))))
 
 (deftest closed-core-records-and-deep-relays-are-rejected
   (is (false? (malli.core/validate hm/RouteBinding (assoc route :unexpected true))))
   (is (hm/nested-relay? "#msg [\"sender\" \"body\"]"))
-  (is (hm/nested-relay? "#psyche [\"sender\" \"context\" \"1/1\" \"words\"]"))
+  (is (hm/nested-relay? "#psyche [\"sender\" \"context\" \"words\"]"))
   (is (false? (hm/nested-relay? "prose mentioning #msg is allowed")))
   (is (false? (hm/nested-relay? "Machine.Relay.{ relayed }")))
   (is (false? (hm/nested-relay? "#msg [\"sender\" \"body\"] trailing")))
