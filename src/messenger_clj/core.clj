@@ -334,11 +334,13 @@
 (defn verify-target! [route]
   (let [reply (target-agent* (transport) route)
         agent (or (:agent reply) reply)]
-    (when-not (and (= (:name route) (:name agent))
+    (when-not (and (= (:session route) (or (:session agent) (:session route)))
                    (= (:pane_id route) (:pane_id agent))
                    (= (:terminal_id route) (:terminal_id agent))
                    (= (:agent route) (:agent agent)))
       (fail "IdentityChanged"))
+    (nonempty-strings! "Live Herdr agent has no current name or agent kind"
+                       [(:name agent) (:agent agent)])
     (when (and (not (:interactive_ready agent))
                (not= (:native_thread route) (get-in route [:readiness_proof :thread_id])))
       (fail "NotReady"))
@@ -361,31 +363,34 @@
    (cond-> (assoc (select-keys agent [:session :name :pane_id :terminal_id :agent])
                   :state "Fallback")
      native-thread (assoc :native_thread native-thread))))
+(def stable-route-keys [:session :pane_id :terminal_id])
+(defn same-stable-route? [left right]
+  (= (select-keys left stable-route-keys)
+     (select-keys right stable-route-keys)))
+(defn refresh-route-snapshot [route agent]
+  (route-binding! (assoc route :name (:name agent) :agent (:agent agent))))
+(defn exact-live-agent [route]
+  (let [hits (filter #(same-stable-route? route %) (live-agents))]
+    (when-not (= 1 (count hits))
+      (fail (if (empty? hits)
+              "Held: stored route has no exact live Herdr identity"
+              "Held: stored route has duplicate live Herdr identities")))
+    (first hits)))
 (defn fallback-route [flow stored pane]
   (cond
     pane (let [{:keys [session pane_id]} (parse-pane pane)
                hits (filter #(and (= session (:session %)) (= pane_id (:pane_id %))) (live-agents))]
            (when-not (= 1 (count hits)) (fail "Held: --pane does not name exactly one live Herdr agent"))
            (fallback-binding (assoc (first hits) :session session) (:native_thread stored)))
-    stored (let [hits (filter #(and (= (:session stored) (:session %)) (= (:name stored) (:name %))) (live-agents))]
-             (when-not (= 1 (count hits)) (fail "Held: stored route has no unique live Herdr agent"))
-             (fallback-binding (first hits) (:native_thread stored)))
+    stored (refresh-route-snapshot stored (exact-live-agent stored))
     :else (let [suffix (re-pattern (str "\\b" (java.util.regex.Pattern/quote flow) "$"))
                 hits (filter #(re-find suffix (or (:name %) "")) (live-agents))]
             (when-not (= 1 (count hits)) (fail "Held: Flow title has no unique live Herdr agent"))
             (fallback-binding (first hits) nil))))
-(defn exact-live-route? [stored]
-  (some #(and (= (:session stored) (:session %))
-              (= (:name stored) (:name %))
-              (= (:pane_id stored) (:pane_id %))
-              (= (:terminal_id stored) (:terminal_id %))
-              (= (:agent stored) (:agent %)))
-        (live-agents)))
 (defn resolve-send-route [flow stored pane]
   (cond
     pane [(fallback-route flow stored pane) true]
-    (and stored (exact-live-route? stored)) [stored false]
-    stored [(fallback-route flow stored nil) true]
+    stored [(refresh-route-snapshot stored (exact-live-agent stored)) false]
     :else [(fallback-route flow nil nil) true]))
 (defn in-transition? [route] (or (:transition route) (= "transition" (:state route))))
 (defn needs-binding? [route] (= "NeedsBinding" (:state route)))
@@ -489,10 +494,21 @@
       (assert-not-retired! flow)
       (let [existing (load-route (registry) flow)]
         (when (:route_hold existing) (fail "Registration is held for route repair"))
-        (let [agents (if session (:agents (herdr! "--session" session "agent" "list")) (live-agents))
-              found (filter #(= name (:name %)) agents)]
-          (when-not (= 1 (count found)) (fail (str "Expected one live agent named " name "; found " (count found) ". Use --session.")))
-          (let [a (assoc (first found) :session (or session (:session (first found))))
+        (let [agents (map #(assoc % :session (or session (:session %)))
+                          (if session (:agents (herdr! "--session" session "agent" "list")) (live-agents)))
+              found (if existing
+                      (filter #(same-stable-route? existing %) agents)
+                      (filter #(= name (:name %)) agents))]
+          (when-not (= 1 (count found))
+            (fail (if existing
+                    (str "Expected one exact live Herdr identity for the existing registration; found " (count found))
+                    (str "Expected one live agent named " name "; found " (count found) ". Use --session."))))
+          (let [listed (assoc (first found) :session (or session (:session (first found))))
+                target-reply (target-agent* (transport) listed)
+                target (assoc (or (:agent target-reply) target-reply) :session (:session listed))
+                _ (when-not (same-stable-route? listed target)
+                    (fail "Herdr agent identity changed during registration"))
+                a target
                 session (:session a)
                 observed (herdr! "--session" session "pane" "process-info" "--pane" (:pane_id a))
                 native-thread (or native-thread (:native_thread existing)
@@ -506,10 +522,13 @@
                           (fail "Agent is not interactively ready")))
                 route (valid! RouteBinding (cond-> (assoc (select-keys a [:session :name :pane_id :terminal_id :agent]) :native_thread native-thread)
                                              proof (assoc :readiness_proof proof)) "RouteBinding")]
-            (when (and existing (not= (:terminal_id existing) (:terminal_id route)))
-              (fail "Flow is already registered to a different terminal"))
+            (when (and existing (not (same-stable-route? existing route)))
+              (fail "Flow is already registered to a different live route identity"))
+            (when (some #(and (not= flow (key %)) (same-stable-route? route (val %)))
+                        (route-records))
+              (fail "Live route identity is already registered to another Flow"))
             (save-route! (registry) flow route)
-            (str "Registered " flow ": " name " (" session ")")))))))
+            (str "Registered " flow ": " (:name route) " (" session ")")))))))
 (defn nonempty-strings! [label fields]
   (when-not (every? #(and (string? %) (not (str/blank? %))) fields)
     (fail label)))
@@ -519,8 +538,8 @@
   (with-reservation flow
     (fn []
       (let [actual (read-route flow)]
-        (when-not (= {:session session :pane_id pane-id :terminal_id terminal-id :name name}
-                     (select-keys actual [:session :pane_id :terminal_id :name]))
+        (when-not (= {:session session :pane_id pane-id :terminal_id terminal-id}
+                     (select-keys actual stable-route-keys))
           (fail "Registration differs from the explicitly revalidated stale route"))
         (store/remove-route! (root) flow)
         (str "Deregistered stale " flow ": " name " (" session "/" pane-id "/" terminal-id ")")))))
@@ -540,12 +559,14 @@
     (with-reservation flow
       (fn []
         (if-let [existing (retirement! flow)]
-          (if (and (= expected (:record existing)) (= native-thread (:native_thread existing)))
+          (if (and (= (dissoc expected :name) (dissoc (:record existing) :name))
+                   (= native-thread (:native_thread existing)))
             (str "Already retired " flow ": marker retained")
             (fail (str "Flow " flow " already has a different retirement marker")))
           (do
             (if-let [route (store/stored-route-for (root) flow)]
-              (when-not (= expected (select-keys route (keys expected)))
+              (when-not (= (dissoc expected :name)
+                           (select-keys route [:session :pane_id :terminal_id :agent]))
                 (fail "Registration differs from the explicitly revalidated retirement route"))
               (when-not allow-absent?
                 (fail "No current registration; use import-retirement only with retained exact evidence")))
@@ -571,19 +592,20 @@
       (let [actual (read-route flow)
             expected {:session session :name old-name :pane_id pane-id :terminal_id terminal-id :agent agent}]
         (when (:route_hold actual) (fail "Registration is held for route repair"))
-        (when-not (= expected (select-keys actual (keys expected)))
+        (when-not (= (dissoc expected :name)
+                     (select-keys actual [:session :pane_id :terminal_id :agent]))
           (fail "Registration differs from the explicitly revalidated old binding"))
         (when-not (= native-thread (:native_thread actual))
           (fail "Registration differs from the explicitly revalidated native thread"))
-        (when (some #(and (not= flow (key %)) (= session (get-in % [1 :session])) (= new-name (get-in % [1 :name])))
-                    (route-records))
-          (fail (str "New agent name " new-name " is already registered in " session)))
-        (let [replacement (route-binding! (assoc actual :name new-name))]
-          ;; `verify-target!` checks exact live identity, readiness, blocked
-          ;; state, and native process before the registry name is changed.
-          (verify-target! replacement)
-          (save-route! (registry) flow replacement)
-          (str "Rebound " flow ": " old-name " -> " new-name " (" session "/" pane-id "/" terminal-id ")"))))))
+        (let [live (verify-target! actual)]
+          (when-not (= new-name (:name live))
+            (fail "Rebind new name differs from the current live Herdr name"))
+          (when (some #(and (not= flow (key %)) (same-stable-route? actual (val %)))
+                      (route-records))
+            (fail "Live route identity is already registered to another Flow"))
+          (let [replacement (refresh-route-snapshot actual live)]
+            (save-route! (registry) flow replacement)
+            (str "Rebound " flow ": " old-name " -> " new-name " (" session "/" pane-id "/" terminal-id ")")))))))
 (defn move-route! [flow record pane-id hold?]
   (let [replacement (cond-> (assoc record :pane_id pane-id)
                       hold? (assoc :route_hold "pane_move_in_progress")
@@ -598,10 +620,7 @@
         process-reply (process-info* (transport) route)
         info (or (:process_info process-reply) process-reply)
         processes (:foreground_processes info)
-        matches (filter #(and (= (:session expected) (:session %))
-                              (= (:name expected) (:name %))
-                              (= (:pane_id route) (:pane_id %))
-                              (= (:terminal_id expected) (:terminal_id %))
+        matches (filter #(and (same-stable-route? route %)
                               (= (:agent expected) (:agent %)))
                         (live-agents))]
     (when-not (and (= (:terminal_id expected) (:terminal_id pane))
@@ -630,7 +649,9 @@
       (let [record (read-route flow)
             expected {:session session :name name :pane_id pane-id :terminal_id terminal-id :agent agent}]
         (when (:route_hold record) (fail "Registration is held for route repair; move refused"))
-        (when-not (and (= expected (select-keys record (keys expected))) (= native-thread (:native_thread record)))
+        (when-not (and (= (dissoc expected :name)
+                          (select-keys record [:session :pane_id :terminal_id :agent]))
+                       (= native-thread (:native_thread record)))
           (fail "Move old route or native thread differs from registration"))
         (let [source (pane-value (pane* (transport) record))
               old-workspace (:workspace_id source)]
@@ -686,6 +707,7 @@
           (when (in-transition? route) (held! flow :InTransition request route))
           (when (:route_hold route) (held! flow :RouteHold request route))
           (let [live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) request route)))
+                route (refresh-route-snapshot route live)
                 keys (get abrupt-keys (:agent route))]
             (when-not keys (fail (str "Hard-abrupt is not supported for " (:agent route) "; nothing sent")))
             (let [envelope (message-envelope sender request)
@@ -760,6 +782,7 @@
                                                             :else :NotRegistered)
                                                  request stored)))
                  live (try (verify-target! route) (catch Exception error (held! flow (held-reason error) request route)))
+                 route (refresh-route-snapshot route live)
                  envelope (message-envelope sender request)
                  submission (try (append-attempt! flow :Submitting :Uncertain route request envelope)
                                  (catch Exception error
@@ -811,10 +834,7 @@
                   (sort-by key (route-records)))
     :retirements (store/retirements (root))}))
 (defn route-matches-agent? [route agent]
-  (and (= (:session route) (:session agent))
-       (= (:name route) (:name agent))
-       (= (:pane_id route) (:pane_id agent))
-       (= (:terminal_id route) (:terminal_id agent))
+  (and (same-stable-route? route agent)
        (= (:agent route) (:agent agent))))
 (defn listing! []
   (let [records (route-records)
